@@ -1,0 +1,23 @@
+name = "VicinityOpt"
+uuid = "b6e7b3a8-3f7c-4ec0-9a1d-6f5e4b9a0001"
+version = "0.1.0"
+
+[deps]
+FermiSea = "17eb78a2-c272-434d-a5cf-0011aaf8e6bd"
+Gmsh = "705231aa-382f-11e9-3f0c-b7cb4346fdeb"
+JLD2 = "033835bb-8acc-5ee8-8aae-3f567f8a3819"
+LinearAlgebra = "37e2e46d-f89d-539d-b4ee-838fcccc9c8e"
+Optim = "429524aa-4258-5aef-a3af-852621145aeb"
+OrdinaryDiffEq = "1dea7af3-3e70-54e6-95c3-0bf5283fa5ed"
+Printf = "de0858da-6303-5e67-8744-51eddeeeb8d7"
+Trixi = "a7f1ee26-1774-49b1-8366-f1abc58fbfcb"
+
+[compat]
+Gmsh = "0.3.1"
+JLD2 = "0.6.4"
+LinearAlgebra = "1.11.0"
+Optim = "2.2.1"
+OrdinaryDiffEq = "6.111.0"
+Printf = "1.11.0"
+Trixi = "0.15.10"
+julia = "1.10"
