@@ -13,6 +13,7 @@ module Objective
 using ..Geometry
 using ..Mesh
 using ..Simulate
+using ..SolverInterface
 
 export bounds_for, make_objective, evaluate_once, EvalState
 
@@ -84,16 +85,17 @@ function evaluate_once(p::AbstractVector{<:Real}, state::EvalState)
         return NaN
     end
 
-    f1, info = try
-        Simulate.run_f1(inp_path, state.sim_cfg)
+    result = try
+        SolverInterface.evaluate(state.sim_cfg, inp_path)
     catch err
         rec = (id=state.counter, status=:sim_failed, reason=string(err),
                f1=NaN, p=collect(p))
         push!(state.history, rec)
         return NaN
     end
+    f1 = result.objective
 
-    rec = (id=state.counter, status=:ok, f1=f1, info=info, p=collect(p))
+    rec = (id=state.counter, status=:ok, f1=f1, info=result, p=collect(p))
     push!(state.history, rec)
     return f1
 end

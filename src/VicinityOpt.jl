@@ -2,12 +2,14 @@ module VicinityOpt
 
 include("geometry.jl")
 include("mesh.jl")
+include("solver_interface.jl")
 include("simulate.jl")
 include("objective.jl")
 include("optimize.jl")
 
 using .Geometry
 using .Mesh
+using .SolverInterface
 using .Simulate
 using .Objective
 using .Optimize
