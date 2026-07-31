@@ -1,0 +1,411 @@
+"""
+    FixedMesh
+
+Density-based ("fixed mesh" / topology-optimization) representation of the
+channel-with-obstacle problem.
+
+Instead of remeshing an obstacle boundary for every candidate shape (the
+`Geometry` + `Mesh` path), we mesh the *empty* channel **once** and represent
+the obstacle as a per-cell density field `ρ(x) ∈ [0, 1]` overlaid on that fixed
+mesh. `ρ = 0` is open fluid, `ρ = 1` is solid obstacle, and intermediate values
+are partially-filled cells (this is what makes the objective smooth in ρ, so a
+gradient / continuation method can be run on top).
+
+The obstacle is realized physically by **Brinkman penalization**: in the
+Boltzmann-moment model, a solid cell is one where current cannot flow, i.e. a
+locally huge momentum-relaxing collision rate. We add a source term
+
+    S_brinkman(u, x) = -α · ρ(x) · diag(0, 1, 1, …, 1) · u
+
+which damps every momentum harmonic (a1, b1, a2, …) — leaving the conserved
+density mode a0 untouched — by `α · ρ(x)`. As ρ → 1 the local current is driven
+to zero, so flow routes around the cell exactly as it would around a wall.
+
+Because the mesh is fixed, one `semidiscretize`/projector setup is reused across
+all ρ evaluations — only the ODE solve reruns. Mutating `field.rho` in place
+changes the operator seen by the next solve.
+"""
+module FixedMesh
+
+using FermiSea
+using Trixi
+using OrdinaryDiffEq
+using Krylov
+using LinearMaps
+using Printf
+using LinearAlgebra: norm
+using ..Geometry: ChannelConfig
+using ..Simulate: SimConfig
+
+export DensityField, BrinkmanSource,
+       write_channel_geo, write_channel_geo_symmetric, paint_blob!, clear!,
+       FixedEvaluator, run_f1_fixed, run_f1_fixed_steady
+
+# ---------------------------------------------------------------------------
+# Density field on a fixed background grid
+# ---------------------------------------------------------------------------
+
+"""
+    DensityField(cfg; nx, ny, alpha_max)
+
+A Cartesian grid of design densities `ρ[i, j] ∈ [0, 1]` covering the channel
+`[0, L_x] × [-W/2, W/2]`, with `nx` cells along x and `ny` along y. `alpha_max`
+is the Brinkman penalization strength at ρ = 1 (the local momentum-relaxing rate
+of a fully-solid cell). The `rho` matrix is mutable and read live by
+`BrinkmanSource`.
+"""
+mutable struct DensityField
+    x0::Float64
+    y0::Float64
+    dx::Float64
+    dy::Float64
+    nx::Int
+    ny::Int
+    alpha_max::Float64
+    rho::Matrix{Float64}   # size (nx, ny); rho[i, j], i↔x, j↔y
+end
+
+function DensityField(cfg::ChannelConfig; nx::Int=24, ny::Int=16,
+                      alpha_max::Real=500.0)
+    x0 = 0.0
+    y0 = -cfg.W / 2
+    dx = cfg.L_x / nx
+    dy = cfg.W / ny
+    return DensityField(x0, y0, dx, dy, nx, ny, Float64(alpha_max),
+                        zeros(Float64, nx, ny))
+end
+
+"Cell-center coordinate of design cell (i, j)."
+@inline cell_center(f::DensityField, i::Int, j::Int) =
+    (f.x0 + (i - 0.5) * f.dx, f.y0 + (j - 0.5) * f.dy)
+
+"Zero out the density field."
+clear!(f::DensityField) = (fill!(f.rho, 0.0); f)
+
+"""
+    penalization(field, px, py) -> α · ρ(px, py)
+
+O(1) lookup of the Brinkman strength at physical point `(px, py)`. Points
+outside the grid clamp to the nearest edge cell (they are never solid in
+practice because the optimizer keeps ρ = 0 near the boundary).
+"""
+@inline function penalization(f::DensityField, px::Real, py::Real)
+    i = clamp(floor(Int, (px - f.x0) / f.dx) + 1, 1, f.nx)
+    j = clamp(floor(Int, (py - f.y0) / f.dy) + 1, 1, f.ny)
+    return f.alpha_max * f.rho[i, j]
+end
+
+# ---------------------------------------------------------------------------
+# Brinkman source term (spatially-varying momentum damping)
+# ---------------------------------------------------------------------------
+
+"""
+    BrinkmanSource(field)
+
+Trixi source term that damps all momentum harmonics by `α · ρ(x)`, leaving the
+density mode a0 undamped. Callable as `src(u, x, t, equations)`.
+"""
+struct BrinkmanSource
+    field::DensityField
+end
+
+@inline function (src::BrinkmanSource)(u, x, t,
+        equations::FermiSea.IsotropicFermiHarmonics2D{NVARS}) where {NVARS}
+    σ = penalization(src.field, x[1], x[2])
+    T = eltype(u)
+    return Trixi.SVector{NVARS, T}(ntuple(i -> i == 1 ? zero(T) : -T(σ) * u[i],
+                                          Val(NVARS)))
+end
+
+# ---------------------------------------------------------------------------
+# Painting obstacles into the density field
+# ---------------------------------------------------------------------------
+
+"""
+    paint_blob!(field, xc, yc, r; width=nothing, additive=false)
+
+Paint a smooth (partially-filled) circular obstacle of radius `r` centered at
+`(xc, yc)` into `field.rho`. Cells deep inside get ρ ≈ 1, cells far outside
+ρ ≈ 0, with a smooth sigmoid transition of half-width `width` (defaults to one
+cell diagonal) — this is the "partial fill" that keeps the map differentiable.
+
+By default the field is overwritten; pass `additive=true` to superimpose onto
+existing density (clamped to 1).
+"""
+function paint_blob!(f::DensityField, xc::Real, yc::Real, r::Real;
+                     width::Union{Nothing,Real}=nothing, additive::Bool=false)
+    w = width === nothing ? hypot(f.dx, f.dy) : Float64(width)
+    additive || fill!(f.rho, 0.0)
+    @inbounds for j in 1:f.ny, i in 1:f.nx
+        cx, cy = cell_center(f, i, j)
+        d = hypot(cx - xc, cy - yc)
+        val = 1.0 / (1.0 + exp((d - r) / w))   # ≈1 inside, ≈0 outside
+        f.rho[i, j] = additive ? min(1.0, f.rho[i, j] + val) : val
+    end
+    return f
+end
+
+# ---------------------------------------------------------------------------
+# Fixed channel geometry (no obstacle) -> .geo
+# ---------------------------------------------------------------------------
+
+"""
+    write_channel_geo(path, cfg)
+
+Emit a `.geo` for the *empty* channel: rectangle `[0, L_x] × [-W/2, W/2]` with
+the four contacts (source/drain on the ends, probe_A/probe_B carved into the top
+and bottom walls) and `walls` for the remaining boundary. No obstacle — that is
+supplied later as a density field. Boundary names match `Simulate`'s BC keys.
+"""
+function write_channel_geo(path::AbstractString, cfg::ChannelConfig)
+    L = cfg.L_x; W = cfg.W
+    xPL = cfg.x_probe - cfg.L_probe / 2
+    xPR = cfg.x_probe + cfg.L_probe / 2
+
+    outer = [
+        (0.0,  -W/2),   # 1 source bottom
+        (xPL,  -W/2),   # 2 bot probe start
+        (xPR,  -W/2),   # 3 bot probe end
+        (L,    -W/2),   # 4 drain bottom
+        (L,    +W/2),   # 5 drain top
+        (xPR,  +W/2),   # 6 top probe end
+        (xPL,  +W/2),   # 7 top probe start
+        (0.0,  +W/2),   # 8 source top
+    ]
+
+    open(path, "w") do io
+        println(io, "SetFactory(\"OpenCASCADE\");")
+        @printf(io, "lc = %.6f;\n\n", cfg.lc)
+        for (i, (x, y)) in enumerate(outer)
+            @printf(io, "Point(%d) = {%.10f, %.10f, 0, lc};\n", i, x, y)
+        end
+        n = length(outer)
+        for i in 1:n
+            j = i == n ? 1 : i + 1
+            @printf(io, "Line(%d) = {%d, %d};\n", i, i, j)
+        end
+        println(io, "Curve Loop(1) = {", join(1:n, ", "), "};")
+        println(io, "Plane Surface(1) = {1};")
+        println(io)
+        println(io, "Physical Surface(\"domain\")        = {1};")
+        println(io, "Physical Curve(\"contact_source\") = {8};")
+        println(io, "Physical Curve(\"contact_drain\")  = {4};")
+        println(io, "Physical Curve(\"probe_A\")        = {6};")
+        println(io, "Physical Curve(\"probe_B\")        = {2};")
+        println(io, "Physical Curve(\"walls\")          = {1, 3, 5, 7};")
+    end
+    return path
+end
+
+"""
+    write_channel_geo_symmetric(path, cfg; h=cfg.lc)
+
+Emit a `.geo` for the empty channel as three **transfinite (structured)** strips
+`[0,xPL] | [xPL,xPR] | [xPR,L]` in x, all sharing one *uniform* y-partition.
+Because the y node distribution is identical and uniform across strips, the
+resulting quad mesh is **exactly mirror-symmetric about y = 0** — so a centered
+obstacle gives `f_1 = 0` to machine precision (no even-in-y_c discretization
+artifact, unlike the unstructured `write_channel_geo`). The middle strip carries
+probe_A (top) / probe_B (bottom); the outer strips' top/bottom are `walls`.
+`h` is the target cell size. Boundary names match `Simulate`'s BC keys.
+"""
+function write_channel_geo_symmetric(path::AbstractString, cfg::ChannelConfig;
+                                     h::Real=cfg.lc)
+    L = cfg.L_x; W2 = cfg.W/2
+    xPL = cfg.x_probe - cfg.L_probe/2
+    xPR = cfg.x_probe + cfg.L_probe/2
+    npts(len) = max(2, round(Int, len/h) + 1)
+    Nx1 = npts(xPL - 0.0); Nx2 = npts(xPR - xPL); Nx3 = npts(L - xPR)
+    Ny  = max(3, round(Int, cfg.W/h) + 1)
+
+    open(path, "w") do io
+        @printf(io, "lc = %.6f;\n", h)
+        pts = [(0.0,-W2),(xPL,-W2),(xPR,-W2),(L,-W2),
+               (L,W2),(xPR,W2),(xPL,W2),(0.0,W2)]
+        for (i,(x,y)) in enumerate(pts)
+            @printf(io, "Point(%d) = {%.10f, %.10f, 0, lc};\n", i, x, y)
+        end
+        # bottom (left→right), top (left→right: 8→7→6→5), verticals (bottom→top)
+        println(io, "Line(1) = {1,2};\nLine(2) = {2,3};\nLine(3) = {3,4};")
+        println(io, "Line(4) = {8,7};\nLine(5) = {7,6};\nLine(6) = {6,5};")
+        println(io, "Line(7) = {1,8};\nLine(8) = {2,7};\nLine(9) = {3,6};\nLine(10) = {4,5};")
+        println(io, "Curve Loop(1) = {1, 8, -4, -7};  Plane Surface(1) = {1};")
+        println(io, "Curve Loop(2) = {2, 9, -5, -8};  Plane Surface(2) = {2};")
+        println(io, "Curve Loop(3) = {3, 10, -6, -9}; Plane Surface(3) = {3};")
+        @printf(io, "Transfinite Curve{1, 4} = %d;\n", Nx1)
+        @printf(io, "Transfinite Curve{2, 5} = %d;\n", Nx2)
+        @printf(io, "Transfinite Curve{3, 6} = %d;\n", Nx3)
+        @printf(io, "Transfinite Curve{7, 8, 9, 10} = %d;\n", Ny)
+        println(io, "Transfinite Surface{1}; Transfinite Surface{2}; Transfinite Surface{3};")
+        println(io, "Recombine Surface{1, 2, 3};")
+        println(io, "Physical Surface(\"domain\")        = {1, 2, 3};")
+        println(io, "Physical Curve(\"contact_source\") = {7};")
+        println(io, "Physical Curve(\"contact_drain\")  = {10};")
+        println(io, "Physical Curve(\"probe_A\")        = {5};")
+        println(io, "Physical Curve(\"probe_B\")        = {2};")
+        println(io, "Physical Curve(\"walls\")          = {1, 3, 4, 6};")
+    end
+    return path
+end
+
+# ---------------------------------------------------------------------------
+# Reusable evaluator: build mesh + semi ONCE, solve per density field
+# ---------------------------------------------------------------------------
+
+"""
+    FixedEvaluator(inp_path, field, sim)
+
+Build the semidiscretization once for the fixed mesh `inp_path`, wiring in the
+base collision operator and a `BrinkmanSource` over `field`. Call
+`run_f1_fixed(ev)` after mutating `field.rho` to (re)solve to steady state and
+read `f_1`. Reusing the same evaluator across candidates skips mesh loading and
+boundary-projector setup — only the ODE solve reruns.
+"""
+mutable struct FixedEvaluator
+    semi::Any
+    field::DensityField
+    sim::SimConfig
+    bc_probe_A::Any
+    bc_probe_B::Any
+    equations::Any
+end
+
+function FixedEvaluator(inp_path::AbstractString, field::DensityField,
+                        sim::SimConfig=SimConfig())
+    equations = FermiSea.IsotropicFermiHarmonics2D(sim.n_harmonics;
+                                                   v_fermi=sim.v_fermi)
+
+    mesh = Trixi.P4estMesh{2}(inp_path; polydeg=sim.polydeg,
+        boundary_symbols=[:contact_source, :contact_drain,
+                          :probe_A, :probe_B, :walls])
+
+    bc_probe_A = FermiSea.FloatingProbeBC()
+    bc_probe_B = FermiSea.FloatingProbeBC()
+    boundary_conditions = (
+        contact_source = FermiSea.CurrentContactBC(sim.I_source),
+        contact_drain  = FermiSea.OhmicContactBC(0.0),
+        probe_A        = bc_probe_A,
+        probe_B        = bc_probe_B,
+        walls          = FermiSea.MaxwellWallBC(1.0),
+    )
+
+    collision = FermiSea.LinearCollisionMatrix(equations;
+        gamma_mr=sim.gamma_mr, gamma_mc=sim.gamma_mc, gamma_3=sim.gamma_3)
+    source_terms = FermiSea.SourceTerms(collision, BrinkmanSource(field))
+
+    initial_condition_zero(x, t, eq) =
+        zero(Trixi.SVector{Trixi.nvariables(eq), Float64})
+
+    solver = DGSEM(polydeg=sim.polydeg, surface_flux=flux_lax_friedrichs)
+    semi = SemidiscretizationHyperbolic(mesh, equations,
+        initial_condition_zero, solver;
+        boundary_conditions=boundary_conditions,
+        source_terms=source_terms)
+
+    return FixedEvaluator(semi, field, sim, bc_probe_A, bc_probe_B, equations)
+end
+
+"""
+    run_f1_fixed(ev; steady_abstol=1e-3, t_end=ev.sim.t_end,
+                 solver_abstol=1e-5, solver_reltol=1e-5) -> (f1, info)
+
+Solve the fixed-mesh problem to steady state for the current `ev.field.rho` and
+return `f1 = (V_A - V_B) / I` plus diagnostics. Mutate `ev.field.rho` (e.g. via
+`paint_blob!`) between calls to evaluate different obstacles.
+
+`steady_abstol` is the `SteadyStateCallback` tolerance on `max|du|`; the tutorial
+uses 1e-2, we default a bit tighter. `converged` in `info` is true when the
+steady-state callback stopped the solve before `t_end` (otherwise we hit the
+time cap and the value should be treated with suspicion). `residual` is the
+final `‖du‖ / max(‖u‖, 1)`.
+"""
+function run_f1_fixed(ev::FixedEvaluator; steady_abstol::Real=1e-3,
+                      t_end::Real=ev.sim.t_end,
+                      solver_abstol::Real=1e-5, solver_reltol::Real=1e-5)
+    t0 = time()
+    sim = ev.sim
+    semi = ev.semi
+
+    ode = Trixi.semidiscretize(semi, (0.0, Float64(t_end)))
+    steady_state = SteadyStateCallback(; abstol=steady_abstol, reltol=0.0)
+    callbacks = CallbackSet(steady_state)
+
+    sol = solve(ode, ROCK4();
+        save_everystep=false, callback=callbacks,
+        abstol=solver_abstol, reltol=solver_reltol)
+
+    # Force a final RHS eval so the boundary caches (floating-probe potentials)
+    # reflect the final state, then read the probe potentials.
+    u_final = sol.u[end]
+    du = similar(u_final)
+    Trixi.rhs!(du, u_final, semi, sol.t[end])
+    residual = norm(du) / max(norm(u_final), 1.0)
+
+    _, _, dg, cache = Trixi.mesh_equations_solver_cache(semi)
+    V_A = FermiSea._current_contact_potential(ev.bc_probe_A, ev.equations, dg, cache)
+    V_B = FermiSea._current_contact_potential(ev.bc_probe_B, ev.equations, dg, cache)
+    f1 = (V_A - V_B) / sim.I_source
+
+    info = (V_A=V_A, V_B=V_B, I_source=sim.I_source,
+            walltime=time() - t0, steps=length(sol.t),
+            t_final=sol.t[end], residual=residual,
+            converged=(sol.t[end] < Float64(t_end) - 1e-9))
+    return f1, info
+end
+
+"""
+    run_f1_fixed_steady(ev; itmax=4000, memory=50, atol=1e-8, rtol=1e-7) -> (f1, info)
+
+Solve the fixed-mesh steady state **directly** as a linear system instead of
+time-stepping. The model is linear, so the steady state satisfies `rhs(u) = 0`,
+i.e. `A u = -b` with `A v := rhs(v) - rhs(0)` (matrix-free via `rhs!`) and
+`b := rhs(0)` (the pure boundary forcing; the Brinkman/collision sources vanish
+at `u = 0`). We solve with restarted GMRES.
+
+This is 50–100× faster than time-stepping for this stiff, slow-diffusive
+regime. **Note on accuracy:** `f_1` is a delicate boundary quantity and only
+settles once the linear residual is small (≲1e-5); the defaults target that.
+`converged` reports whether GMRES hit its tolerance; even when it stops on
+`itmax`, `residual` is the true steady residual to trust.
+"""
+function run_f1_fixed_steady(ev::FixedEvaluator; itmax::Int=4000, memory::Int=50,
+                             atol::Real=1e-8, rtol::Real=1e-7)
+    t0 = time()
+    semi = ev.semi
+    sim = ev.sim
+
+    ode = Trixi.semidiscretize(semi, (0.0, 1.0))
+    u0 = zero(ode.u0)
+    N = length(u0)
+
+    b = similar(u0)
+    Trixi.rhs!(b, u0, semi, 0.0)        # affine forcing b = rhs(0)
+
+    scratch = similar(u0)
+    function matvec!(out, v)
+        Trixi.rhs!(scratch, v, semi, 0.0)
+        @. out = scratch - b
+        return out
+    end
+    A = LinearMap{Float64}((out, v) -> matvec!(out, v), N; ismutating=true)
+
+    u, stats = Krylov.gmres(A, -b; restart=true, memory=memory,
+                            atol=Float64(atol), rtol=Float64(rtol), itmax=itmax)
+
+    # Final rhs! syncs boundary caches (floating-probe potentials).
+    du = similar(u)
+    Trixi.rhs!(du, u, semi, 0.0)
+    residual = norm(du) / max(norm(u), 1.0)
+
+    _, _, dg, cache = Trixi.mesh_equations_solver_cache(semi)
+    V_A = FermiSea._current_contact_potential(ev.bc_probe_A, ev.equations, dg, cache)
+    V_B = FermiSea._current_contact_potential(ev.bc_probe_B, ev.equations, dg, cache)
+    f1 = (V_A - V_B) / sim.I_source
+
+    info = (V_A=V_A, V_B=V_B, I_source=sim.I_source,
+            walltime=time() - t0, iters=stats.niter,
+            residual=residual, converged=stats.solved)
+    return f1, info
+end
+
+end # module

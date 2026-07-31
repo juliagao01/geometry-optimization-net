@@ -1,0 +1,11 @@
+# Generated mesh / field artifacts (reproducible from scripts/)
+*.h5
+*.pos
+runs/**/*.inp
+runs/**/*.geo
+runs/**/*.p4est_ready.inp
+runs/**/*_preproc.inp
+
+# Archives / OS cruft
+*.tar.gz
+.DS_Store

@@ -19,13 +19,18 @@ to quads, exactly as FermiSea.jl's tutorial does. Writes `inp_path` (Abaqus
 format) ready for `Trixi.P4estMesh{2}`.
 """
 function geo_to_inp(geo_path::AbstractString, inp_path::AbstractString;
-                    verbose::Bool=false)
+                    verbose::Bool=false, structured::Bool=false)
     gmsh.initialize()
     try
         gmsh.option.setNumber("General.Terminal", verbose ? 1 : 0)
         gmsh.open(geo_path)
-        gmsh.option.setNumber("Mesh.Algorithm", 11)    # quasi-structured quad
-        gmsh.option.setNumber("Mesh.RecombineAll", 1)
+        if !structured
+            # unstructured quad meshing (default). For a `.geo` that defines its
+            # own Transfinite/Recombine directives, pass structured=true so these
+            # aren't overridden by the quasi-structured algorithm.
+            gmsh.option.setNumber("Mesh.Algorithm", 11)    # quasi-structured quad
+            gmsh.option.setNumber("Mesh.RecombineAll", 1)
+        end
         gmsh.option.setNumber("Mesh.SaveGroupsOfNodes", 1)
         gmsh.model.mesh.generate(2)
         gmsh.write(inp_path)
