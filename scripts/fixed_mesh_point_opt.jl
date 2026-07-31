@@ -12,7 +12,10 @@ include(joinpath(@__DIR__, "pointgeo.jl"))
 
 cfg = ChannelConfig(L_x=1.0, W=0.6)
 sim = SimConfig(n_harmonics=6, gamma_mc=100.0, gamma_mr=0.05, gamma_3=100.0, polydeg=1)
-ALPHA=2000.0; EPS=1e-10; NX=22; NY=14; VOLFRAC=0.12; NITER=60; FILTR=2.5; MU=1.0
+# design grid must be COARSER than the mesh node spacing (h=0.05 below), else some
+# design cells contain no mesh node -> silent zero-gradient variables. NX<=L/h=20,
+# NY<=W/h=12.
+ALPHA=2000.0; EPS=1e-10; NX=18; NY=11; VOLFRAC=0.12; NITER=60; FILTR=2.5; MU=1.0
 workdir = joinpath(@__DIR__, "..", "runs", "fixed_mesh"); mkpath(workdir)
 geo=joinpath(workdir,"cp.geo"); inp=joinpath(workdir,"cp.inp")
 write_point_geo(geo; L=cfg.L_x, W=cfg.W, xPL=cfg.x_probe-cfg.L_probe/2,

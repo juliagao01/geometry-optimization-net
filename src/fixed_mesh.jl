@@ -42,7 +42,8 @@ export DensityField, BrinkmanSource,
        write_channel_geo, write_channel_geo_symmetric, write_point_geo,
        paint_blob!, clear!,
        FixedEvaluator, run_f1_fixed, run_f1_fixed_steady,
-       FixedOperator, assemble_fixed_operator, f1_exact, f1_adjoint_grad
+       FixedOperator, assemble_fixed_operator, f1_exact, f1_adjoint_grad,
+       f1_exact_perdof, fourier_perdof
 
 # ---------------------------------------------------------------------------
 # Density field on a fixed background grid
@@ -103,21 +104,31 @@ end
 # ---------------------------------------------------------------------------
 
 """
-    BrinkmanSource(field)
+    BrinkmanSource(field; damp_a0=false)
 
 Trixi source term that damps all momentum harmonics by `α · ρ(x)`, leaving the
-density mode a0 undamped. Callable as `src(u, x, t, equations)`.
+density mode a0 undamped (a reflecting-wall-like obstacle). With `damp_a0=true`
+the density mode is damped too — an *absorbing* obstacle whose interior is truly
+dead (no floating undamped-density region), for which `f_1` converges to a finite
+hard-wall limit as `α → ∞` (the default momentum-only obstacle has `f_1 ∝ α`).
 """
 struct BrinkmanSource
     field::DensityField
+    damp_a0::Bool
 end
+BrinkmanSource(field::DensityField; damp_a0::Bool=false) =
+    BrinkmanSource(field, damp_a0)
 
 @inline function (src::BrinkmanSource)(u, x, t,
         equations::FermiSea.IsotropicFermiHarmonics2D{NVARS}) where {NVARS}
     σ = penalization(src.field, x[1], x[2])
     T = eltype(u)
-    return Trixi.SVector{NVARS, T}(ntuple(i -> i == 1 ? zero(T) : -T(σ) * u[i],
-                                          Val(NVARS)))
+    if src.damp_a0
+        return Trixi.SVector{NVARS, T}(ntuple(i -> -T(σ) * u[i], Val(NVARS)))
+    else
+        return Trixi.SVector{NVARS, T}(ntuple(i -> i == 1 ? zero(T) : -T(σ) * u[i],
+                                              Val(NVARS)))
+    end
 end
 
 # ---------------------------------------------------------------------------
@@ -274,7 +285,7 @@ mutable struct FixedEvaluator
 end
 
 function FixedEvaluator(inp_path::AbstractString, field::DensityField,
-                        sim::SimConfig=SimConfig())
+                        sim::SimConfig=SimConfig(); damp_a0::Bool=false)
     equations = FermiSea.IsotropicFermiHarmonics2D(sim.n_harmonics;
                                                    v_fermi=sim.v_fermi)
 
@@ -294,7 +305,7 @@ function FixedEvaluator(inp_path::AbstractString, field::DensityField,
 
     collision = FermiSea.LinearCollisionMatrix(equations;
         gamma_mr=sim.gamma_mr, gamma_mc=sim.gamma_mc, gamma_3=sim.gamma_3)
-    source_terms = FermiSea.SourceTerms(collision, BrinkmanSource(field))
+    source_terms = FermiSea.SourceTerms(collision, BrinkmanSource(field; damp_a0=damp_a0))
 
     initial_condition_zero(x, t, eq) =
         zero(Trixi.SVector{Trixi.nvariables(eq), Float64})
@@ -582,6 +593,7 @@ singular). `f_1` is stable as `ε→0`; the default is deep in that plateau.
 function f1_exact(op::FixedOperator, rho_grid::AbstractMatrix;
                   alpha::Real, eps::Real=1e-10)
     rpd = zeros(op.N); _rho_to_perdof!(rpd, op, rho_grid)
+    clamp!(rpd, 0.0, 1.0)   # ρ<0 would flip damping to gain (indefinite A)
     A = op.A0 + spdiagm(0 => (alpha .* rpd) .* op.b1u) + eps * spdiagm(0 => ones(op.N))
     return dot(op.c, lu(A) \ (-op.bvec))
 end
@@ -608,6 +620,46 @@ function f1_adjoint_grad(op::FixedOperator, rho_grid::AbstractMatrix;
         gj != 0.0 && (g[op.cellof[j]] += gj)
     end
     return f1, reshape(g, op.nx, op.ny)
+end
+
+"""
+    f1_exact_perdof(op, rpd; alpha, eps=1e-10) -> f1
+
+Like [`f1_exact`](@ref) but takes a per-dof density vector directly (e.g. from
+[`fourier_perdof`](@ref)), bypassing the design-grid lookup.
+"""
+function f1_exact_perdof(op::FixedOperator, rpd::AbstractVector;
+                         alpha::Real, eps::Real=1e-10)
+    rpd = clamp.(rpd, 0.0, 1.0)   # ρ<0 would flip damping to gain (indefinite A)
+    A = op.A0 + spdiagm(0 => (alpha .* rpd) .* op.b1u) + eps * spdiagm(0 => ones(op.N))
+    return dot(op.c, lu(A) \ (-op.bvec))
+end
+
+"""
+    fourier_perdof(op; r0, yc=0.0, C=Float64[], xc=0.5, width=0.02) -> Vector
+
+Per-dof density of a Fourier obstacle
+`R(θ) = r0 + Σ_n (C[2n-1] cos nθ + C[2n] sin nθ)` (center `(xc, yc)`), evaluated
+**analytically at each mesh node** — no design-grid staircase. Feed to
+[`f1_exact_perdof`](@ref) for tight mesh convergence.
+"""
+function fourier_perdof(op::FixedOperator; r0::Real, yc::Real=0.0,
+                        C::AbstractVector=Float64[], xc::Real=0.5, width::Real=0.02)
+    rpd = zeros(op.N); ev = op.ev; semi = ev.semi
+    _, equations, _, cache = Trixi.mesh_equations_solver_cache(semi)
+    nvars = Trixi.nvariables(equations)
+    w = Trixi.wrap_array(rpd, semi); nc = cache.elements.node_coordinates
+    nn = size(w, 2); nel = size(w, 4); M = length(C) ÷ 2
+    for e in 1:nel, jj in 1:nn, ii in 1:nn
+        x = nc[1, ii, jj, e]; y = nc[2, ii, jj, e]
+        dx = x - xc; dy = y - yc; d = hypot(dx, dy); th = atan(dy, dx); R = float(r0)
+        @inbounds for n in 1:M
+            R += C[2n-1] * cos(n*th) + C[2n] * sin(n*th)
+        end
+        val = 1.0 / (1.0 + exp((d - R) / width))
+        for v in 1:nvars; w[v, ii, jj, e] = val; end
+    end
+    return rpd
 end
 
 end # module

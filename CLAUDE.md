@@ -134,22 +134,35 @@ gradient/topology optimization. Key API (`src/fixed_mesh.jl`):
   vector, so `A u = -b` is non-unique and `f_1` was ill-defined. Fixed with
   **Tikhonov (min-norm) regularization** (`+εI`, ε≈1e-10); `f_1` is stable as
   ε→0. This is the root cause of the project's historic `f_1` instability.
-- **Full-edge contacts give f_1 ≈ 0 for ANY obstacle** (uniform 1-D flow, no
-  vicinity signal — verified: reg-LU `f_1 ∝ ε → 0`). **Narrow point contacts**
-  create the spreading 2-D flow that carries a real signal.
 - **The obstacle must be solid** (α ≈ 2000, not 100 — at α=100 current flows
   straight through). High-α solves are stiff; GMRES stalls, so use `f1_exact`.
-- **Optimum shape** = a large circle (radius ≈ channel width) with **sin-harmonic
-  dimples**: a plain big circle must be near-centered (size-vs-offset constraint)
-  → `f_1=0` by symmetry, so the **dimples** (e.g. `b2` sin-2θ) break symmetry and
-  carry the signal. Result at α=2000: `f_1 ≈ 3×10²`, ε-convergent to machine
-  precision, mesh-robust to ~5%. Saved to `runs/fixed_mesh/result_circle.jld2`.
-- **`f_1` magnitude scales ∝ α (no hard-wall limit)**: solidity sweep gives f_1 =
-  37/312/3046/15305 at α = 200/2000/2e4/1e5. So the absolute magnitude is
-  α-dependent (a Brinkman property for this boundary observable) — optimize and
-  compare shapes at a *fixed* α; "f_1≈312" means α=2000. f_1 is nearly independent
-  of γ_mc (ballistic↔hydrodynamic, ~2%) and of contact width for wc≲0.3 (~7%),
-  collapsing to 0 only at the full-edge (wc→W) limit.
+- **Optimum SHAPE = a large circle with sin-harmonic dimples** (this part is
+  trustworthy, physics-audited): a plain big circle must be near-centered
+  (size-vs-offset constraint) → `f_1=0` by symmetry, so the **dimples** (`b2`
+  sin-2θ etc.) break y-symmetry and carry the signal. Saved to
+  `runs/fixed_mesh/result_circle.jld2`.
+
+⚠️ **The f_1 MAGNITUDE from this fixed-mesh Brinkman setup is NOT a converged
+physical vicinity resistance** (audit + investigation, 2026-07-31). Three
+independent problems, do not trust the number:
+- **Probe contamination (~90%)**: the obstacle's soft edge deposits ρ on the
+  floating-probe walls, damping current *on the probe itself*. Excluding a 0.01
+  band at the wall dropped f_1 from 269 → 27 (`scripts/fixed_mesh_contam.jl`).
+  Always keep the obstacle a margin off every contact (the optimizer now masks
+  ρ within `EXCL=0.04` of the ±W/2 walls).
+- **α-divergence (no hard-wall limit)**: reflecting (momentum-only) Brinkman
+  gives `f_1 ∝ α` (76/269/6343/25413 at α=500/2e3/5e4/2e5); the `damp_a0=true`
+  "absorbing" variant → 0. Neither is a true reflecting wall.
+- **h-divergence**: even the analytic (non-staircase) density gives f_1 rising
+  monotonically with refinement (236→269→299→333→344 at h=.055→.028).
+- **Contact width barely matters** (f_1 ~250–300 for wc=20–90% of the wall) — so
+  the earlier "point contacts are necessary" claim is WRONG for a dimpled
+  obstacle; the robustness is consistent with the contamination being at the
+  probes, not the source/drain.
+- **For a trustworthy, α-independent number you need a true reflecting-wall
+  obstacle** (`MaxwellWallBC` on a boundary-fitted obstacle hole) — which leaves
+  the fixed-mesh density idea. That's the recommended next step if the magnitude
+  matters.
 
 ### Environment / running
 
