@@ -32,14 +32,17 @@ using Trixi
 using OrdinaryDiffEq
 using Krylov
 using LinearMaps
+using SparseArrays
 using Printf
-using LinearAlgebra: norm
+using LinearAlgebra: norm, lu, dot
 using ..Geometry: ChannelConfig
 using ..Simulate: SimConfig
 
 export DensityField, BrinkmanSource,
-       write_channel_geo, write_channel_geo_symmetric, paint_blob!, clear!,
-       FixedEvaluator, run_f1_fixed, run_f1_fixed_steady
+       write_channel_geo, write_channel_geo_symmetric, write_point_geo,
+       paint_blob!, clear!,
+       FixedEvaluator, run_f1_fixed, run_f1_fixed_steady,
+       FixedOperator, assemble_fixed_operator, f1_exact, f1_adjoint_grad
 
 # ---------------------------------------------------------------------------
 # Density field on a fixed background grid
@@ -406,6 +409,205 @@ function run_f1_fixed_steady(ev::FixedEvaluator; itmax::Int=4000, memory::Int=50
             walltime=time() - t0, iters=stats.niter,
             residual=residual, converged=stats.solved)
     return f1, info
+end
+
+# ---------------------------------------------------------------------------
+# Point-contact vicinity geometry (narrow source/drain instead of full edges)
+# ---------------------------------------------------------------------------
+
+"""
+    write_point_geo(path; L, W, xPL, xPR, wc, h)
+
+Emit a `.geo` for the vicinity geometry with **narrow point contacts**: a 3×3
+grid of transfinite blocks with a y-symmetric partition (so the mesh is exactly
+mirror-symmetric). Source/drain are width-`wc` contacts centered on the
+left/right walls; probe_A/probe_B are centered on the top/bottom walls; the rest
+is `walls`. Full-edge contacts give ~0 vicinity signal (uniform flow); point
+contacts create the spreading 2-D flow that carries a real signal.
+"""
+function write_point_geo(path::AbstractString; L=1.0, W=0.6, xPL=0.425, xPR=0.575,
+                         wc=0.12, h=0.03)
+    xs = (0.0, xPL, xPR, L)
+    ys = (-W/2, -wc/2, wc/2, W/2)
+    Nx = ntuple(i -> max(2, round(Int, (xs[i+1]-xs[i])/h)+1), 3)
+    Ny = ntuple(j -> max(2, round(Int, (ys[j+1]-ys[j])/h)+1), 3)
+    pid(i,j) = (i-1)*4 + j
+    H(i,j) = (j-1)*3 + i          # horizontal line P(i,j)->P(i+1,j)
+    V(i,j) = 12 + (i-1)*3 + j     # vertical line   P(i,j)->P(i,j+1)
+    open(path, "w") do io
+        @printf(io, "lc=%.6f;\n", h)
+        for i in 1:4, j in 1:4
+            @printf(io, "Point(%d)={%.10f,%.10f,0,lc};\n", pid(i,j), xs[i], ys[j])
+        end
+        for j in 1:4, i in 1:3
+            @printf(io, "Line(%d)={%d,%d};\n", H(i,j), pid(i,j), pid(i+1,j))
+        end
+        for i in 1:4, j in 1:3
+            @printf(io, "Line(%d)={%d,%d};\n", V(i,j), pid(i,j), pid(i,j+1))
+        end
+        sid = 0
+        for i in 1:3, j in 1:3
+            sid += 1
+            @printf(io, "Curve Loop(%d)={%d,%d,%d,%d};\n", sid,
+                    H(i,j), V(i+1,j), -H(i,j+1), -V(i,j))
+            @printf(io, "Plane Surface(%d)={%d};\n", sid, sid)
+        end
+        for i in 1:3, j in 1:4; @printf(io, "Transfinite Curve{%d}=%d;\n", H(i,j), Nx[i]); end
+        for i in 1:4, j in 1:3; @printf(io, "Transfinite Curve{%d}=%d;\n", V(i,j), Ny[j]); end
+        for s in 1:9; @printf(io, "Transfinite Surface{%d};\n", s); end
+        print(io, "Recombine Surface{"); print(io, join(1:9, ",")); println(io, "};")
+        println(io, "Physical Surface(\"domain\")={", join(1:9, ","), "};")
+        @printf(io, "Physical Curve(\"contact_source\")={%d};\n", V(1,2))
+        @printf(io, "Physical Curve(\"contact_drain\") ={%d};\n", V(4,2))
+        @printf(io, "Physical Curve(\"probe_A\")={%d};\n", H(2,4))
+        @printf(io, "Physical Curve(\"probe_B\")={%d};\n", H(2,1))
+        walls = [H(1,1),H(3,1),H(1,4),H(3,4),V(1,1),V(1,3),V(4,1),V(4,3)]
+        println(io, "Physical Curve(\"walls\")={", join(walls, ","), "};")
+    end
+    return path
+end
+
+# ---------------------------------------------------------------------------
+# Exact assembled operator: reg-LU forward solve + discrete-adjoint gradient
+# ---------------------------------------------------------------------------
+
+"""
+    FixedOperator
+
+Assembled sparse operator for exact (regularized-LU) steady solves and the
+discrete-adjoint gradient of `f_1` w.r.t. the density design grid. Fields:
+`A0` (streaming+collision+boundary Jacobian at ρ=0), `c` (the `f_1 = cᵀu`
+functional), `b1u` (Brinkman diagonal per unit density, α=1), `bvec` (`rhs(0)`
+forcing), `cellof` (dof → design-cell index for gradient scatter). Built by
+[`assemble_fixed_operator`](@ref).
+"""
+struct FixedOperator
+    A0::SparseMatrixCSC{Float64,Int}
+    c::Vector{Float64}
+    b1u::Vector{Float64}
+    bvec::Vector{Float64}
+    cellof::Vector{Int}
+    ev::FixedEvaluator
+    nx::Int
+    ny::Int
+    N::Int
+end
+
+_probe_f1(ev, dg, cache) =
+    (FermiSea._current_contact_potential(ev.bc_probe_A, ev.equations, dg, cache) -
+     FermiSea._current_contact_potential(ev.bc_probe_B, ev.equations, dg, cache)) /
+    ev.sim.I_source
+
+"""
+    assemble_fixed_operator(ev; tol=1e-12) -> FixedOperator
+
+Assemble the sparse operator once by probing `rhs!` with unit vectors (also
+recovering the `f_1` functional `c` and the Brinkman unit-diagonal `b1u`). The
+operator is ρ-independent; each density then costs one sparse LU. Because the
+undamped density mode makes the bare steady state singular, solves are
+regularized (min-norm); see [`f1_exact`](@ref).
+"""
+function assemble_fixed_operator(ev::FixedEvaluator; tol::Real=1e-12)
+    semi = ev.semi; field = ev.field
+    _, equations, dg, cache = Trixi.mesh_equations_solver_cache(semi)
+    nvars = Trixi.nvariables(equations)
+
+    clear!(field)
+    ode = Trixi.semidiscretize(semi, (0.0, 1.0))
+    N = length(ode.u0)
+    bvec = similar(ode.u0); Trixi.rhs!(bvec, zero(ode.u0), semi, 0.0)
+
+    Ir = Int[]; Jc = Int[]; Vv = Float64[]; c = zeros(N)
+    tmp = similar(bvec); ej = zeros(N)
+    for j in 1:N
+        ej[j] = 1.0
+        Trixi.rhs!(tmp, ej, semi, 0.0)
+        c[j] = _probe_f1(ev, dg, cache)
+        ej[j] = 0.0
+        @inbounds for i in 1:N
+            v = tmp[i] - bvec[i]
+            abs(v) > tol && (push!(Ir, i); push!(Jc, j); push!(Vv, v))
+        end
+    end
+    A0 = sparse(Ir, Jc, Vv, N, N)
+
+    # Brinkman unit diagonal at α=1: b1u = rhs_{ρ=1,α=1}(𝟙) − rhs_{ρ=0}(𝟙)
+    saved_alpha = field.alpha_max; field.alpha_max = 1.0
+    onev = ones(N); fill!(field.rho, 1.0)
+    r1 = similar(bvec); Trixi.rhs!(r1, onev, semi, 0.0)
+    clear!(field); r0 = similar(bvec); Trixi.rhs!(r0, onev, semi, 0.0)
+    b1u = r1 .- r0
+    field.alpha_max = saved_alpha
+
+    # dof -> design-cell (same floor lookup as penalization)
+    cellof = zeros(Int, N)
+    tf = zeros(N); w = Trixi.wrap_array(tf, semi)
+    nc = cache.elements.node_coordinates; nn = size(w, 2); nel = size(w, 4)
+    for e in 1:nel, jj in 1:nn, ii in 1:nn
+        x = nc[1, ii, jj, e]; y = nc[2, ii, jj, e]
+        ci = clamp(floor(Int, (x - field.x0)/field.dx) + 1, 1, field.nx)
+        cj = clamp(floor(Int, (y - field.y0)/field.dy) + 1, 1, field.ny)
+        lin = ci + (cj - 1) * field.nx
+        for v in 1:nvars; w[v, ii, jj, e] = lin; end
+    end
+    cellof .= round.(Int, tf)
+
+    return FixedOperator(A0, c, b1u, bvec, cellof, ev, field.nx, field.ny, N)
+end
+
+# Fill a per-dof density vector from the design grid (same lookup as penalization).
+function _rho_to_perdof!(rpd::Vector{Float64}, op::FixedOperator, rho_grid::AbstractMatrix)
+    ev = op.ev; field = ev.field; semi = ev.semi
+    _, equations, _, cache = Trixi.mesh_equations_solver_cache(semi)
+    nvars = Trixi.nvariables(equations)
+    w = Trixi.wrap_array(rpd, semi); nc = cache.elements.node_coordinates
+    nn = size(w, 2); nel = size(w, 4)
+    for e in 1:nel, jj in 1:nn, ii in 1:nn
+        x = nc[1, ii, jj, e]; y = nc[2, ii, jj, e]
+        ci = clamp(floor(Int, (x - field.x0)/field.dx) + 1, 1, field.nx)
+        cj = clamp(floor(Int, (y - field.y0)/field.dy) + 1, 1, field.ny)
+        for v in 1:nvars; w[v, ii, jj, e] = rho_grid[ci, cj]; end
+    end
+    return rpd
+end
+
+"""
+    f1_exact(op, rho_grid; alpha, eps=1e-10) -> f1
+
+Exact `f_1` for the density `rho_grid` via a Tikhonov-regularized sparse LU:
+`(A0 + diag(α·ρ·b1u) + εI) u = -b`, `f_1 = cᵀu`. The `εI` selects the
+minimum-norm solution (the undamped density mode makes the bare system
+singular). `f_1` is stable as `ε→0`; the default is deep in that plateau.
+"""
+function f1_exact(op::FixedOperator, rho_grid::AbstractMatrix;
+                  alpha::Real, eps::Real=1e-10)
+    rpd = zeros(op.N); _rho_to_perdof!(rpd, op, rho_grid)
+    A = op.A0 + spdiagm(0 => (alpha .* rpd) .* op.b1u) + eps * spdiagm(0 => ones(op.N))
+    return dot(op.c, lu(A) \ (-op.bvec))
+end
+
+"""
+    f1_adjoint_grad(op, rho_grid; alpha, eps=1e-10) -> (f1, grad)
+
+`f_1` and its gradient w.r.t. every design cell, from one forward + one adjoint
+solve (the problem is linear): `∂f_1/∂ρ_cell = -Σ_{j∈cell} λ_j·(α·b1u_j)·u_j`
+with `Aᵀλ = c`. `grad` is an `op.nx × op.ny` matrix. Verified against finite
+differences to ~1e-6.
+"""
+function f1_adjoint_grad(op::FixedOperator, rho_grid::AbstractMatrix;
+                         alpha::Real, eps::Real=1e-10)
+    rpd = zeros(op.N); _rho_to_perdof!(rpd, op, rho_grid)
+    A = op.A0 + spdiagm(0 => (alpha .* rpd) .* op.b1u) + eps * spdiagm(0 => ones(op.N))
+    F = lu(A)
+    u = F \ (-op.bvec)
+    f1 = dot(op.c, u)
+    λ = F' \ op.c
+    g = zeros(op.nx * op.ny)
+    @inbounds for j in 1:op.N
+        gj = -λ[j] * (alpha * op.b1u[j]) * u[j]
+        gj != 0.0 && (g[op.cellof[j]] += gj)
+    end
+    return f1, reshape(g, op.nx, op.ny)
 end
 
 end # module

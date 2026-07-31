@@ -69,7 +69,7 @@ with `Pkg.activate(joinpath(@__DIR__, ".."))`, so run from anywhere.
 
 ## Architecture
 
-`src/VicinityOpt.jl` includes and re-exports six submodules. The dependency
+`src/VicinityOpt.jl` includes and re-exports seven submodules. The dependency
 order is important — each `include` depends on the ones above it:
 
 1. **`geometry.jl` (`Geometry`)** — `ChannelConfig`, `ObstacleParams`,
@@ -93,6 +93,9 @@ order is important — each `include` depends on the ones above it:
 6. **`optimize.jl` (`Optimize`)** — `OptConfig` + `run_optimization`, driving
    **Optim.jl `ParticleSwarm`**, saving `best_p`, `best_f1`, `history` to
    `runs/*/result.jld2`.
+7. **`fixed_mesh.jl` (`FixedMesh`)** — the current line of work (see below):
+   density/Brinkman obstacle on a fixed mesh + the exact assembled-operator
+   solver and adjoint.
 
 ### Parameter vector
 
@@ -101,6 +104,59 @@ order is important — each `include` depends on the ones above it:
 `r(θ) = r0 + Σ (a_n cos nθ + b_n sin nθ)` centered at `(cfg.x_c, y_c)`;
 `x_c` is fixed at channel center. By up-down symmetry, `f_1 = 0` unless the
 shape breaks y-symmetry (offset `y_c ≠ 0`, or nonzero `b_sin`).
+
+## Fixed-mesh density method (`FixedMesh`, the current line of work)
+
+Instead of remeshing an obstacle boundary per candidate, mesh the empty channel
+**once** and represent the obstacle as a per-cell density `ρ(x) ∈ [0,1]`. A cell
+is made "solid" by **Brinkman penalization** — a source term that damps the
+momentum harmonics by `α·ρ(x)` (leaving the density mode a0 alone), so high-ρ
+cells block current like a wall. This makes the objective smooth in ρ, enabling
+gradient/topology optimization. Key API (`src/fixed_mesh.jl`):
+
+- `DensityField`, `BrinkmanSource`, `paint_blob!` — the ρ grid + coupling.
+- `write_channel_geo_symmetric` — mirror-symmetric structured mesh (mesh it with
+  `geo_to_inp(...; structured=true)`, which skips the Algorithm-11 override that
+  would otherwise destroy the transfinite grid).
+- `write_point_geo` — **narrow point-contact** vicinity geometry (3×3 transfinite
+  blocks, y-symmetric).
+- `run_f1_fixed_steady` — matrix-free GMRES steady solve.
+- `assemble_fixed_operator` → `FixedOperator`, then `f1_exact(op, ρ; alpha, eps)`
+  (exact reg-LU) and `f1_adjoint_grad(op, ρ; alpha, eps)` (full gradient from 2
+  solves; verified vs finite-diff to 1e-6). **This is the canonical solver** —
+  scripts predate it and inline the same assembly.
+
+### Hard-won facts (do not re-derive)
+
+- **Time-stepping is hopeless** here (stiff + slow-diffusive); one solve was
+  ~1000 s. Use the direct solvers.
+- **The steady operator is singular** — the undamped density mode a0 is a null
+  vector, so `A u = -b` is non-unique and `f_1` was ill-defined. Fixed with
+  **Tikhonov (min-norm) regularization** (`+εI`, ε≈1e-10); `f_1` is stable as
+  ε→0. This is the root cause of the project's historic `f_1` instability.
+- **Full-edge contacts give f_1 ≈ 0 for ANY obstacle** (uniform 1-D flow, no
+  vicinity signal — verified: reg-LU `f_1 ∝ ε → 0`). **Narrow point contacts**
+  create the spreading 2-D flow that carries a real signal.
+- **The obstacle must be solid** (α ≈ 2000, not 100 — at α=100 current flows
+  straight through). High-α solves are stiff; GMRES stalls, so use `f1_exact`.
+- **Optimum shape** = a large circle (radius ≈ channel width) with **sin-harmonic
+  dimples**: a plain big circle must be near-centered (size-vs-offset constraint)
+  → `f_1=0` by symmetry, so the **dimples** (e.g. `b2` sin-2θ) break symmetry and
+  carry the signal. Result: `f_1 ≈ 3×10²`, ε-convergent to machine precision,
+  mesh-robust to ~10%. Saved to `runs/fixed_mesh/result_circle.jld2`.
+
+### Environment / running
+
+Finer meshes get **OOM/SIGTERM-killed** here; run heavy Julia with
+`julia --threads=2 --gcthreads=1 --heap-size-hint=6G`. Julia block-buffers
+stdout to files — `flush(stdout)` in scripts. Gmsh GUIs pop up via
+`gmsh.fltk.run()`; **do not mesh a jagged obstacle-as-hole** (`generate(2)`
+hangs in edge recovery) — show CAD geometry or the fixed mesh + a boundary
+overlay instead. Visualize the optimized shape with
+`RESULT=result_circle.jld2 julia --project=. scripts/show_gmsh_grid.jl` (fixed
+mesh grid + obstacle boundary) or `.../show_gmsh_boundary.jl` (boundary in
+perimeter); `scripts/make_plot.jl` builds an HTML figure via FermiSea's
+`save_cartesian`.
 
 ## Watch out for (code vs. README drift)
 
