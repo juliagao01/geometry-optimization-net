@@ -142,8 +142,14 @@ gradient/topology optimization. Key API (`src/fixed_mesh.jl`):
 - **Optimum shape** = a large circle (radius ≈ channel width) with **sin-harmonic
   dimples**: a plain big circle must be near-centered (size-vs-offset constraint)
   → `f_1=0` by symmetry, so the **dimples** (e.g. `b2` sin-2θ) break symmetry and
-  carry the signal. Result: `f_1 ≈ 3×10²`, ε-convergent to machine precision,
-  mesh-robust to ~10%. Saved to `runs/fixed_mesh/result_circle.jld2`.
+  carry the signal. Result at α=2000: `f_1 ≈ 3×10²`, ε-convergent to machine
+  precision, mesh-robust to ~5%. Saved to `runs/fixed_mesh/result_circle.jld2`.
+- **`f_1` magnitude scales ∝ α (no hard-wall limit)**: solidity sweep gives f_1 =
+  37/312/3046/15305 at α = 200/2000/2e4/1e5. So the absolute magnitude is
+  α-dependent (a Brinkman property for this boundary observable) — optimize and
+  compare shapes at a *fixed* α; "f_1≈312" means α=2000. f_1 is nearly independent
+  of γ_mc (ballistic↔hydrodynamic, ~2%) and of contact width for wc≲0.3 (~7%),
+  collapsing to 0 only at the full-edge (wc→W) limit.
 
 ### Environment / running
 
