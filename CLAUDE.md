@@ -209,6 +209,34 @@ probes straddling the injector at ~W with a tight single-injector layout, and/or
 revisiting the m≥2 viscous closure (γ_3) — not yet done. Do not claim negative
 vicinity resistance from the current results.
 
+### Hard-wall obstacle attempt (reg-GMRES / reg-LU) — h-NON-convergent (2026-08-02)
+
+Tried to get a trustworthy OBSTACLE number via the boundary-fitted `MaxwellWallBC`
+obstacle-as-hole (`scripts/fixed_mesh_wallobstacle.jl`, moderate R0=0.12), applying
+the vicinity reg-GMRES breakthrough. **Result: the plan failed at the h-convergence
+gate — do not pursue Phase-2 re-optimization on this basis.**
+- **reg-GMRES does NOT converge** on the holed reflecting-boundary operator (every
+  ε hit itmax=30000, res~10–50, conv=false). Unlike the *structured* vicinity mesh,
+  the *unstructured* Algorithm-8 hole + curved `MaxwellWallBC` gives a spectrum GMRES
+  can't crack without a preconditioner. (Confirms the original CLAUDE.md note.)
+- **reg-LU IS feasible & ε-exact** here (N only 12k–32k for the moderate obstacle,
+  not the ~1e5 that OOM'd): f_1 = −1.51542680 flat to **8 digits** over ε=1e-8…1e-12.
+- **BUT f_1 is h-NON-convergent**: reg-LU over h=.090/.075/.062/.052/.042/.033 gives
+  −1.515 / **+1.543** / −1.410 / −2.234 / −6.152 / **+0.166** — scatters across
+  [−6,+1.5] and **flips sign**. Diagnostic (`scripts/fixed_mesh_walldiag.jl`): the
+  pipeline is **fully deterministic** (3 rebuilds identical to 6 digits) and ε-stable,
+  so this is a **genuine discretization pathology, not noise** — a small
+  reflecting-wall transresistance swamped by O(1) discretization error on the coarse
+  unstructured hole mesh (boundary polygon `nobs` matters only ~10%). Converging would
+  need much finer meshes (OOM-blocked) or a boundary-fitted **structured** obstacle
+  mesh (not built).
+- **Net:** THREE obstacle representations now fail a trustworthy f_1 — Brinkman
+  (α/h-divergent + contaminated), hard-wall+reg-GMRES (solver won't converge),
+  hard-wall+reg-LU (exact solve, h-non-convergent). **The obstacle-free vicinity
+  device (f_1≈0.020) remains the only trustworthy number.** A trustworthy obstacle f_1
+  needs a preconditioned fine-mesh solver or a structured boundary-fitted mesh —
+  neither available in this environment.
+
 ### Environment / running
 
 Finer meshes get **OOM/SIGTERM-killed** here; run heavy Julia with

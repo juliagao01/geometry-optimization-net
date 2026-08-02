@@ -65,7 +65,8 @@ function mesh_it(geo,inp)
     inp
 end
 
-function f1_wall(h)
+# --- common setup: mesh the holed domain and build the semidiscretization ---
+function build_semi(h)
     geo=joinpath(workdir,"wall.geo"); inp=joinpath(workdir,"wall.inp")
     write_wall_geo(geo; h=h, nobs=48); mesh_it(geo,inp)
     equations = FermiSea.IsotropicFermiHarmonics2D(sim.n_harmonics; v_fermi=sim.v_fermi)
@@ -86,21 +87,56 @@ function f1_wall(h)
                FermiSea._current_contact_potential(bcB,equations,dg,cache))/sim.I_source
     ode=Trixi.semidiscretize(semi,(0.0,1.0)); N=length(ode.u0)
     b=similar(ode.u0); Trixi.rhs!(b,zero(ode.u0),semi,0.0)
-    # assemble sparse A by probing (GMRES fails on this singular operator); reg-LU.
-    Ir=Int[];Jc=Int[];Vv=Float64[];c=zeros(N);tmp=similar(b);ej=zeros(N)
-    for j in 1:N
-        ej[j]=1.0; Trixi.rhs!(tmp,ej,semi,0.0); c[j]=extract(); ej[j]=0.0
-        @inbounds for i in 1:N
-            v=tmp[i]-b[i]; abs(v)>1e-12 && (push!(Ir,i);push!(Jc,j);push!(Vv,v))
-        end
-    end
-    A=sparse(Ir,Jc,Vv,N,N)+EPS*spdiagm(0=>ones(N))
-    dot(c, lu(A)\(-b)), N
+    return (; semi, extract, N, b, u0=ode.u0)
 end
 
-println("\n=== TRUE hard-wall (MaxwellWallBC) f_1, h-convergence ===")
-for h in (0.09, 0.075, 0.062, 0.052)
-    t=time(); f1,N=f1_wall(h)
-    @printf("  h=%.3f  N=%6d  f_1=%+.6e  (%.0fs)\n", h, N, f1, time()-t); flush(stdout); GC.gc()
+# --- matrix-free Tikhonov-reg GMRES: matvec rhs(v)-b+εv (the unblocking solver;
+# ε cures the singular a0 nullspace AND conditions the op so GMRES converges) ---
+function f1_gmres(s; eps=1e-8)
+    scr=similar(s.b)
+    A=LinearMap{Float64}((out,v)->(Trixi.rhs!(scr,v,s.semi,0.0); @. out=scr-s.b+eps*v; out),
+                         s.N; ismutating=true)
+    u,st=Krylov.gmres(A,-s.b; restart=true, memory=100, atol=1e-11, rtol=1e-10, itmax=30000)
+    du=similar(u); Trixi.rhs!(du,u,s.semi,0.0)
+    (f1=s.extract(), it=st.niter, res=norm(du .+ eps.*u)/max(norm(u),1), conv=st.solved)
+end
+
+# --- probing assembly + reg-LU: ground-truth cross-check (feasible at small N) ---
+function f1_lu(s; eps=1e-10)
+    N=s.N; Ir=Int[];Jc=Int[];Vv=Float64[];c=zeros(N);tmp=similar(s.b);ej=zeros(N)
+    for j in 1:N
+        ej[j]=1.0; Trixi.rhs!(tmp,ej,s.semi,0.0); c[j]=s.extract(); ej[j]=0.0
+        @inbounds for i in 1:N
+            v=tmp[i]-s.b[i]; abs(v)>1e-12 && (push!(Ir,i);push!(Jc,j);push!(Vv,v))
+        end
+    end
+    A=sparse(Ir,Jc,Vv,N,N)+eps*spdiagm(0=>ones(N))
+    dot(c, lu(A)\(-s.b))
+end
+
+# === A) coarse mesh: reg-LU ε-insensitivity (ground truth), and CONFIRM matrix-free
+#        reg-GMRES stalls on this unstructured holed + reflecting-boundary operator
+#        (it converged for the clean STRUCTURED vicinity mesh, but not here — needs a
+#        preconditioner). reg-LU is therefore the solver of record for the hard wall. ===
+println("\n=== A) reg-LU ε-check + GMRES-convergence probe @ coarse h=0.09 ===")
+let s = build_semi(0.09)
+    @printf("  N=%d\n", s.N); flush(stdout)
+    for eps in (1e-8,1e-10,1e-12)
+        t=time(); f1 = f1_lu(s; eps=eps)
+        @printf("  reg-LU  ε=%.0e  f_1=%+.8e  (%.0fs)\n", eps, f1, time()-t); flush(stdout)
+    end
+    t=time(); r = f1_gmres(s; eps=1e-8)
+    @printf("  GMRES   ε=1e-8   f_1=%+.6e  (it=%d res=%.0e conv=%s %.0fs)  <- expected NON-conv\n",
+            r.f1, r.it, r.res, r.conv, time()-t); flush(stdout)
+end
+
+# === B) h-convergence via reg-LU (feasible: moderate obstacle keeps N≲35k).
+#        No α to sweep — this is a REAL reflecting wall, so the whole α-divergence
+#        class is gone by construction, as is the soft-ρ probe contamination. ===
+EPS=1e-10
+println("\n=== B) TRUE hard-wall (MaxwellWallBC) f_1, h-convergence (reg-LU, ε=$(EPS)) ===")
+for h in (0.09, 0.075, 0.062, 0.052, 0.042, 0.033)
+    t=time(); s = build_semi(h); f1 = f1_lu(s; eps=EPS)
+    @printf("  h=%.3f  N=%6d  f_1=%+.6e  (%.0fs)\n", h, s.N, f1, time()-t); flush(stdout); GC.gc()
 end
 println("DONE"); flush(stdout)

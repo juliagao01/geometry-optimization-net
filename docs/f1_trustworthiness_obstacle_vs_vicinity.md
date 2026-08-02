@@ -167,3 +167,47 @@ resistance; do **not** claim negative vicinity resistance from it.
   physics, the rectangular device is already the trustworthy path; to chase the
   negative vicinity resistance, revisit the diffuse-wall BC and the m≥2 moment
   closure.
+
+---
+
+## Addendum (2026-08-02) — the hard-wall obstacle attempt also fails to converge
+
+Followed the "trustworthy obstacle number" recommendation above: carve the obstacle
+as a boundary-fitted `MaxwellWallBC` **hole** (a true reflecting wall — no α, no
+Brinkman, no soft-ρ tail), moderate `R0=0.12`, and apply the vicinity reg-GMRES
+solver (`scripts/fixed_mesh_wallobstacle.jl`). **The plan failed at the
+h-convergence gate.**
+
+1. **reg-GMRES does not converge** on the holed operator: every ε ∈ {1e-4…1e-10} hit
+   itmax=30000 with residual ~10–50 (`conv=false`). The *structured* vicinity mesh
+   was GMRES-friendly; the *unstructured* Algorithm-8 hole + curved reflecting
+   boundary is not (needs a preconditioner).
+2. **reg-LU is feasible and ε-exact** — the "reg-LU OOMs" blocker was only for the
+   fine-mesh N≈1e5 optimized shape; the moderate obstacle keeps N=12k–32k. f₁ =
+   **−1.51542680**, flat to **8 digits** over ε=1e-8…1e-12 at h=0.09.
+3. **But f₁ is h-NON-convergent.** reg-LU over h = .090/.075/.062/.052/.042/.033:
+
+   | h | N | f₁ |
+   |---|---|---|
+   | .090 | 11880 | −1.515 |
+   | .075 | 11880 | **+1.543** |
+   | .062 | 15336 | −1.410 |
+   | .052 | 22896 | −2.234 |
+   | .042 | 26244 | −6.152 |
+   | .033 | 32328 | **+0.166** |
+
+   It scatters across [−6, +1.5] and **flips sign** — no convergence.
+4. **Diagnostic** (`scripts/fixed_mesh_walldiag.jl`): the pipeline is **fully
+   deterministic** (3 rebuilds at h=0.062 → −1.410332 identical to 6 digits) and
+   ε-stable, so the scatter is a **genuine discretization pathology, not meshing
+   noise** — a small reflecting-wall transresistance swamped by O(1) discretization
+   error on the coarse unstructured hole mesh (obstacle-polygon `nobs` matters only
+   ~10%: −1.410 at nobs=48 → −1.545 at nobs=96). Converging needs much finer meshes
+   (OOM-blocked here) or a boundary-fitted **structured** obstacle mesh (not built).
+
+**Updated bottom line.** THREE obstacle representations now fail a trustworthy f₁:
+Brinkman (α/h-divergent + probe-contaminated), hard-wall + reg-GMRES (solver won't
+converge), hard-wall + reg-LU (exact solve, h-non-convergent). **The obstacle-free
+vicinity device (f₁≈0.020) is the only trustworthy number available in this
+environment.** A trustworthy *obstacle* f₁ requires a preconditioned fine-mesh solver
+or a structured boundary-fitted obstacle mesh — neither currently available.
