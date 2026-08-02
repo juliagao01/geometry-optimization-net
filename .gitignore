@@ -1,10 +1,11 @@
-# Generated mesh / field artifacts (reproducible from scripts/)
+# Generated mesh / field artifacts — regenerable from scripts/, never commit.
+# (These were tracked before this rule existed; untracked in the 2026-08 cleanup.)
+*.inp
+*.geo
 *.h5
 *.pos
-runs/**/*.inp
-runs/**/*.geo
-runs/**/*.p4est_ready.inp
-runs/**/*_preproc.inp
+
+# Experiment results (.jld2) ARE tracked on purpose — do not ignore them.
 
 # Archives / OS cruft
 *.tar.gz
