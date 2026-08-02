@@ -40,7 +40,7 @@ using ..Simulate: SimConfig
 
 export DensityField, BrinkmanSource,
        write_channel_geo, write_channel_geo_symmetric, write_point_geo,
-       paint_blob!, clear!,
+       write_vicinity_geo, paint_blob!, clear!,
        FixedEvaluator, run_f1_fixed, run_f1_fixed_steady,
        FixedOperator, assemble_fixed_operator, f1_exact, f1_adjoint_grad,
        f1_exact_perdof, fourier_perdof
@@ -285,7 +285,8 @@ mutable struct FixedEvaluator
 end
 
 function FixedEvaluator(inp_path::AbstractString, field::DensityField,
-                        sim::SimConfig=SimConfig(); damp_a0::Bool=false)
+                        sim::SimConfig=SimConfig(); damp_a0::Bool=false,
+                        drain_bc=FermiSea.OhmicContactBC(0.0))
     equations = FermiSea.IsotropicFermiHarmonics2D(sim.n_harmonics;
                                                    v_fermi=sim.v_fermi)
 
@@ -297,7 +298,7 @@ function FixedEvaluator(inp_path::AbstractString, field::DensityField,
     bc_probe_B = FermiSea.FloatingProbeBC()
     boundary_conditions = (
         contact_source = FermiSea.CurrentContactBC(sim.I_source),
-        contact_drain  = FermiSea.OhmicContactBC(0.0),
+        contact_drain  = drain_bc,   # OhmicContactBC(0) default; CurrentContactBC(-I) for an injector pair
         probe_A        = bc_probe_A,
         probe_B        = bc_probe_B,
         walls          = FermiSea.MaxwellWallBC(1.0),
@@ -474,6 +475,72 @@ function write_point_geo(path::AbstractString; L=1.0, W=0.6, xPL=0.425, xPR=0.57
         @printf(io, "Physical Curve(\"probe_B\")={%d};\n", H(2,1))
         walls = [H(1,1),H(3,1),H(1,4),H(3,4),V(1,1),V(1,3),V(4,1),V(4,3)]
         println(io, "Physical Curve(\"walls\")={", join(walls, ","), "};")
+    end
+    return path
+end
+
+"""
+    write_vicinity_geo(path; L, W, wc, h, xs, dA, dB)
+
+Emit a `.geo` for a literature-standard **Bandurin–Levitov vicinity device** (no
+obstacle): a rectangular sample with all contacts as narrow segments on the
+**bottom edge** — an adjacent current **injector pair** (`contact_source` at
+`[xs, xs+wc]`, `contact_drain` at `[xs+wc, xs+2wc]`) and two floating voltage
+probes on the vicinity side (`probe_A` near, gap `dA`; `probe_B` far, gap `dB`).
+Built as a 1-row strip of transfinite blocks (columns split at each contact
+boundary, shared uniform y-partition) → structured all-quad mesh, no hole; mesh
+with `geo_to_inp(...; structured=true)`. The vicinity resistance is
+`f_1 = (V_A - V_B)/I`, which turns negative in the hydrodynamic (viscous) regime.
+"""
+function write_vicinity_geo(path::AbstractString; L=2.0, W=0.8, wc=0.1, h=0.05,
+                            xs=1.25, dA=0.15, dB=0.45, xd=nothing)
+    # xd=nothing → adjacent injector pair (local dipole); xd set → drain far away
+    # (canonical Bandurin nonlocal layout: probes sit in the current-free vicinity).
+    drain = xd === nothing ? (xs + wc, xs + 2wc) : (xd, xd + wc)
+    contacts = [(xs,          xs + wc,      "contact_source"),
+                (drain[1],    drain[2],     "contact_drain"),
+                (xs - dA - wc, xs - dA,     "probe_A"),
+                (xs - dB - wc, xs - dB,     "probe_B")]
+    sort!(contacts, by=first)
+    # fill [0,L] with alternating wall / contact segments (each = one column)
+    segs = Tuple{Float64,Float64,String}[]; cur = 0.0
+    for (a,b,name) in contacts
+        a > cur + 1e-9 && push!(segs, (cur, a, "walls"))
+        push!(segs, (a, b, name)); cur = b
+    end
+    cur < L - 1e-9 && push!(segs, (cur, L, "walls"))
+    Ncol = length(segs)
+    xsplit = vcat(segs[1][1], [s[2] for s in segs])      # length Ncol+1
+    Ny = max(3, round(Int, W/h) + 1)
+    open(path, "w") do io
+        @printf(io, "lc=%.6f;\n", h)
+        for i in 1:Ncol+1
+            @printf(io, "Point(%d)={%.8f,0,0,lc};\n", i, xsplit[i])
+            @printf(io, "Point(%d)={%.8f,%.8f,0,lc};\n", 100+i, xsplit[i], W)
+        end
+        for i in 1:Ncol;   @printf(io, "Line(%d)={%d,%d};\n", i, i, i+1); end          # bottom BL_i
+        for i in 1:Ncol;   @printf(io, "Line(%d)={%d,%d};\n", 200+i, 100+i, 100+i+1); end # top TL_i
+        for i in 1:Ncol+1; @printf(io, "Line(%d)={%d,%d};\n", 300+i, i, 100+i); end    # vert VL_i
+        for i in 1:Ncol
+            @printf(io, "Curve Loop(%d)={%d,%d,%d,%d};\n", i, i, 300+i+1, -(200+i), -(300+i))
+            @printf(io, "Plane Surface(%d)={%d};\n", i, i)
+        end
+        for i in 1:Ncol
+            nx = max(2, round(Int, (xsplit[i+1]-xsplit[i])/h) + 1)
+            @printf(io, "Transfinite Curve{%d,%d}=%d;\n", i, 200+i, nx)
+        end
+        for i in 1:Ncol+1; @printf(io, "Transfinite Curve{%d}=%d;\n", 300+i, Ny); end
+        for i in 1:Ncol;   @printf(io, "Transfinite Surface{%d};\n", i); end
+        print(io, "Recombine Surface{"); print(io, join(1:Ncol, ",")); println(io, "};")
+        println(io, "Physical Surface(\"domain\")={", join(1:Ncol, ","), "};")
+        for name in ("contact_source","contact_drain","probe_A","probe_B")
+            ids = [i for i in 1:Ncol if segs[i][3] == name]
+            @printf(io, "Physical Curve(\"%s\")={%s};\n", name, join(ids, ","))
+        end
+        wallids = vcat([i for i in 1:Ncol if segs[i][3] == "walls"],   # wall bottom segs
+                       [200+i for i in 1:Ncol],                          # all top segs
+                       [301, 300+Ncol+1])                                # left/right ends
+        println(io, "Physical Curve(\"walls\")={", join(wallids, ","), "};")
     end
     return path
 end

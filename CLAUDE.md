@@ -164,14 +164,65 @@ independent problems, do not trust the number:
   the fixed-mesh density idea. That's the recommended next step if the magnitude
   matters.
 
+### Clean vicinity device (no obstacle) — the trustworthy baseline f_1 (2026-08-01)
+
+To get a **numerically trustworthy** f_1 without the Brinkman α/hole problems,
+drop the obstacle and build the literature Bandurin–Levitov **vicinity device**:
+a rectangular sample with narrow contacts on the bottom edge only. Added
+`write_vicinity_geo(path; L,W,wc,h,xs,dA,dB, xd=nothing)` to `src/fixed_mesh.jl`
+(structured all-quad strip, no hole → meshes cleanly, `Algorithm=11` is fine) and
+a `drain_bc` kwarg to `FixedEvaluator` (vicinity uses `CurrentContactBC(-I)` for
+the drain, not the default `OhmicContactBC(0)`). `xd=nothing` = adjacent
+source+drain injector pair; `xd` set = drain placed far away (canonical nonlocal
+layout, probes in the current-free vicinity region). Scripts:
+`scripts/fixed_mesh_vicinity.jl` (convergence + γ_mc sweep, adjacent pair),
+`scripts/fixed_mesh_vicinity_neg.jl` (far-drain negative-R test),
+`scripts/show_gmsh_vicinity.jl` (GUI).
+
+**Solver — matrix-free Tikhonov-regularized GMRES.** matvec = `rhs(v)-b+εv`;
+the `+εv` both cures the undamped-a0 nullspace AND conditions the operator so
+GMRES converges (the un-regularized `run_f1_steady` GMRES fails — see the
+retraction section). Here f_1 is **ε-insensitive** (reg-LU eps-sweep gave
+0.0327272 flat over ε=1e-6…1e-14), so ε=1e-6 is exact and needs **no O(N)
+assembly** — this is what makes fine meshes (N~1e5) affordable where the probing
+assembly OOM-killed. Use this pattern, not `assemble_fixed_operator`, for
+obstacle-free vicinity solves.
+
+**f_1 IS mesh-convergent** (the key trust win, adjacent pair, γ_mc=100, M=6):
+h=.065/.050/.040/.033/.027 → 0.0535/0.0327/0.0247/0.0213/**0.0204**
+(N up to 117k; successive Δ ratio ~0.4 → converges to f_1 ≈ **0.020**, last step
+3.8%). n_harmonics M=4→10 converges to ~0.0333 (M=6 within 2%). GMRES res ~1e-9
+everywhere. **This is a trustworthy converged f_1** — unlike the Brinkman
+obstacle number.
+
+⚠️ **BUT the Bandurin–Levitov negative-vicinity sign change did NOT reproduce.**
+γ_mc sweep (ballistic→viscous→ohmic) stays **positive and monotonic** in BOTH
+geometries: adjacent pair 6.10→0.016 (γ_mc=0.1→200); far drain 7.70→0.018. No
+dip below zero anywhere, including the viscous window (γ_mc~2–10, where l_mc<W<l_mr
+with v_F=1, W=0.8). This is **not** a misconfiguration: walls are
+`MaxwellWallBC(1.0)` = fully **diffuse/no-slip** (accommodation=1 → diffuse
+re-emission; confirmed in FermiSea source), which is the condition that *promotes*
+viscous backflow. So the converged f_1 is a trustworthy **nonlocal/spreading
+resistance**, but the specific viscous negative-R hallmark is absent in this
+truncated-moment setup at these params. Chasing it further (if wanted) means:
+probes straddling the injector at ~W with a tight single-injector layout, and/or
+revisiting the m≥2 viscous closure (γ_3) — not yet done. Do not claim negative
+vicinity resistance from the current results.
+
 ### Environment / running
 
 Finer meshes get **OOM/SIGTERM-killed** here; run heavy Julia with
 `julia --threads=2 --gcthreads=1 --heap-size-hint=6G`. Julia block-buffers
 stdout to files — `flush(stdout)` in scripts. Gmsh GUIs pop up via
-`gmsh.fltk.run()`; **do not mesh a jagged obstacle-as-hole** (`generate(2)`
-hangs in edge recovery) — show CAD geometry or the fixed mesh + a boundary
-overlay instead. Visualize the optimized shape with
+`gmsh.fltk.run()`. **Meshing an obstacle-as-hole: `Mesh.Algorithm=11` HANGS**
+in 2D edge-recovery on a holed domain here — use **`Mesh.Algorithm=8`**
+(Frontal-Delaunay quads) + `RecombinationAlgorithm=1`, which meshes a hole in
+~0.1 s. Even so, the boundary-fitted **hard-wall (MaxwellWallBC) obstacle solve
+is currently blocked in this environment**: the unstructured hole mesh gives
+N≈1e5, matrix-free GMRES does not converge on the singular operator (needs a
+preconditioner), and the direct assemble+reg-LU path keeps getting SIGTERM/OOM-
+killed. A trustworthy hard-wall f_1 needs a preconditioned solver or more memory.
+For visualization only, show CAD geometry or the fixed mesh + a boundary overlay. Visualize the optimized shape with
 `RESULT=result_circle.jld2 julia --project=. scripts/show_gmsh_grid.jl` (fixed
 mesh grid + obstacle boundary) or `.../show_gmsh_boundary.jl` (boundary in
 perimeter); `scripts/make_plot.jl` builds an HTML figure via FermiSea's
