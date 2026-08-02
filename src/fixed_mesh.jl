@@ -43,7 +43,8 @@ export DensityField, BrinkmanSource,
        write_vicinity_geo, paint_blob!, clear!,
        FixedEvaluator, run_f1_fixed, run_f1_fixed_steady,
        FixedOperator, assemble_fixed_operator, f1_exact, f1_adjoint_grad,
-       f1_exact_perdof, fourier_perdof
+       f1_exact_perdof, fourier_perdof,
+       solve_nonlinear_steady
 
 # ---------------------------------------------------------------------------
 # Density field on a fixed background grid
@@ -286,7 +287,8 @@ end
 
 function FixedEvaluator(inp_path::AbstractString, field::DensityField,
                         sim::SimConfig=SimConfig(); damp_a0::Bool=false,
-                        drain_bc=FermiSea.OhmicContactBC(0.0))
+                        drain_bc=FermiSea.OhmicContactBC(0.0),
+                        extra_sources=())
     equations = FermiSea.IsotropicFermiHarmonics2D(sim.n_harmonics;
                                                    v_fermi=sim.v_fermi)
 
@@ -306,7 +308,8 @@ function FixedEvaluator(inp_path::AbstractString, field::DensityField,
 
     collision = FermiSea.LinearCollisionMatrix(equations;
         gamma_mr=sim.gamma_mr, gamma_mc=sim.gamma_mc, gamma_3=sim.gamma_3)
-    source_terms = FermiSea.SourceTerms(collision, BrinkmanSource(field; damp_a0=damp_a0))
+    source_terms = FermiSea.SourceTerms(collision, BrinkmanSource(field; damp_a0=damp_a0),
+                                        extra_sources...)
 
     initial_condition_zero(x, t, eq) =
         zero(Trixi.SVector{Trixi.nvariables(eq), Float64})
@@ -687,6 +690,47 @@ function f1_adjoint_grad(op::FixedOperator, rho_grid::AbstractMatrix;
         gj != 0.0 && (g[op.cellof[j]] += gj)
     end
     return f1, reshape(g, op.nx, op.ny)
+end
+
+"""
+    solve_nonlinear_steady(op, ev_nl; Iscale=1.0, eps=1e-8, maxit=200, tol=1e-9, relax=1.0)
+        -> (u, res, iters, converged)
+
+Modified-Newton (chord) solve of the NONLINEAR steady state for injected current
+`Iscale` (relative to the unit forcing baked into `op`). Reuses the linear operator
+`op.A0` (+εI, Tikhonov for the a0 nullspace), factorized ONCE, as a fixed Jacobian —
+each iteration is one `rhs!` + one back-substitution.
+
+`op` must come from a LINEAR `FixedEvaluator` (no nonlinear source, `I_source=1`), so
+`op.A0`/`op.bvec` are the pure linear operator/forcing and `op.c` is the raw ΔV
+functional. `ev_nl` is the MATCHING evaluator built WITH the nonlinear source (also
+`I_source=1`). Because `A0` and the nonlinear source are current-independent and only
+the linear forcing scales with `I`, the target-current residual is
+`rhs_nl(u) + (Iscale-1)·op.bvec`, so an entire current sweep reuses one assembly and
+one factorization. The raw probe drop is then `ΔV(Iscale) = dot(op.c, u)` (the
+floating-probe potential is linear in `u`, so this holds for the nonlinear solution
+too). Converges for weak-to-moderate nonlinearity — the regime in which the low-order
+response coefficients (`f_2`, …) are well defined.
+"""
+function solve_nonlinear_steady(op::FixedOperator, ev_nl::FixedEvaluator;
+                                Iscale::Real=1.0, eps::Real=1e-8,
+                                maxit::Int=200, tol::Real=1e-9, relax::Real=1.0)
+    semi = ev_nl.semi
+    # We call rhs! on this semi directly (never via semidiscretize), so its contact-BC
+    # projector caches must be initialized explicitly (semidiscretize does this auto).
+    FermiSea.initialize_boundary_projectors!(semi)
+    F = lu(op.A0 + eps * spdiagm(0 => ones(op.N)))
+    shift = (Iscale - 1.0) .* op.bvec
+    u = F \ (-(Iscale .* op.bvec))          # linear solution at this current = initial guess
+    r = similar(u); res = Inf; iters = 0; converged = false
+    for k in 1:maxit
+        iters = k
+        Trixi.rhs!(r, u, semi, 0.0); r .+= shift   # nonlinear residual at current Iscale
+        res = norm(r) / max(norm(u), 1)
+        res < tol && (converged = true; break)
+        u .-= relax .* (F \ r)                      # chord step (fixed Jacobian)
+    end
+    return u, res, iters, converged
 end
 
 """

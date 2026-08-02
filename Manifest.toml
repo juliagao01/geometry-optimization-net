@@ -599,7 +599,7 @@ version = "1.3.1"
 
 [[deps.FermiSea]]
 deps = ["HDF5", "LinearAlgebra", "Logging", "LoggingExtras", "StaticArrays", "Trixi"]
-path = "../cu/FermiSea.jl"
+path = "/Users/juliagao/cu/FermiSea-nl"
 uuid = "17eb78a2-c272-434d-a5cf-0011aaf8e6bd"
 version = "0.1.1"
 
