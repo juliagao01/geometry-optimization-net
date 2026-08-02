@@ -155,3 +155,40 @@ The step-1 scope decision (which nonlinearity, where it lives — FermiSea core 
 term in this repo, which solver, and how far to take it) is a project/advisor call because
 the convective term touches FermiSea's core flux kernel and its eigendecomposition-based
 characteristic boundary machinery — the most invasive part of the engine.
+
+---
+
+## Addendum (2026-08-02) — nonlinear pipeline IMPLEMENTED and validated
+
+Built the end-to-end nonlinear pipeline in a dedicated workspace (editable FermiSea
+clone `~/cu/FermiSea-nl` on branch `nonlinear-convective`; this repo on branch
+`nonlinear`, `main` unchanged).
+
+**What was added**
+- **`InertialStressSource`** (FermiSea `src/equations/isotropic_fermi_harmonics_2d.jl`):
+  a Trixi source term for the *local* (algebraic) part of the convective coupling —
+  `(a1,b1)~(jx,jy)` feed the m=2 stress harmonics via the traceless `j⊗j` tensor
+  `da2 += λ(a1²−b1²)`, `db2 += λ(2 a1 b1)`. Quadratic in the state, `λ=0` = linear.
+- **`solve_nonlinear_steady`** (`src/fixed_mesh.jl`): modified-Newton (chord) solve of
+  `rhs_nl(u)=0`, reusing ONE reg-LU factorization of the linear operator (`op.A0+εI`) as
+  a fixed Jacobian; the current sweep reuses one assembly via a forcing shift.
+- **`FixedEvaluator(...; extra_sources=…)`** hook; **`scripts/fixed_mesh_nonlinear.jl`**
+  driver (λ-sweep × I-sweep, fits `ΔV=f1·I+f2·I²+f3·I³`).
+
+**Validation (vicinity device, h=0.07, M=4, γ_mc=100)**
+- **λ=0 → f2 = 1.1e-17** (machine noise): recovers the linear null-test exactly. ✅
+- **λ>0 → nonzero f2**, and **f2/λ = −0.01476 constant to 4 digits** over λ=1e-3…3e-2
+  (slight droop to −0.01467 at λ=0.1 as higher-order-in-λ terms enter): f2 is linear in
+  λ at leading order — the nonlinearity IS the source of f2. ✅
+- Chord solver converges in 2–11 iterations (residual ~1e-11) at every λ and I. ✅
+- **Caveat — f2 magnitude not yet mesh-converged**: at coarse h=.09/.07/.055 it reads
+  −2.05/−1.48/−2.24 ×1e-4 (~35% scatter, no sign flips). A higher-order quantity needs
+  finer meshes than f1 did; a proper finer-h convergence study is the next validation.
+
+**Scope note.** This is the *local* inertial-stress nonlinearity — the correct `j⊗j`
+tensor structure but not the full convective operator (the gradient `∇·` part is
+flux-level and needs the mentor-coordinated FermiSea-core change). It is a genuine,
+controllable nonlinearity sufficient to prove and de-risk the entire machinery
+(nonlinear solver + f2 extraction + λ/I validation). Remaining for a *physical* f2:
+(1) the flux-level convective term (with the mentor); (2) the finer-h convergence study;
+(3) optimize over **source–drain-asymmetric** shapes (f2 needs inversion breaking).
