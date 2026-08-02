@@ -13,6 +13,44 @@ maximizes the linear response coefficient
 
 where `I` is the current injected at the source contact.
 
+## ⚠️ Status (2026-08-02) — read this first
+
+The text below describes the **original obstacle-optimization design**. The project
+has since moved on, and **all obstacle `f_1` numbers are retracted / untrustworthy**
+(the `0.385` circle and `0.972` deformed values here, and every later Brinkman /
+hard-wall obstacle number). Three obstacle representations were tried and each fails
+to give a mesh-convergent, α-independent number:
+
+- **Brinkman-density obstacle** — `f_1 ∝ α` (no hard-wall limit), h-divergent, and
+  probe-contaminated.
+- **Hard-wall (`MaxwellWallBC`) obstacle-as-hole + reg-GMRES** — solver does not
+  converge on the singular unstructured operator (needs a preconditioner).
+- **Hard-wall + reg-LU** — exact ε-stable solve, but `f_1` is h-non-convergent
+  (scatters across `[−6, +1.5]`, flips sign).
+
+**The one trustworthy result** is an **obstacle-free** literature vicinity device
+(Bandurin–Levitov layout: narrow injector + same-edge voltage probes, no obstacle):
+
+```
+f_1 ≈ 0.020        # mesh-converged (Δ 3.8% across a 2× refinement, N→117k),
+                   # ε-insensitive, α-free — a genuine nonlocal spreading resistance
+```
+
+Caveat: the negative-vicinity (viscous-backflow) sign change did **not** reproduce in
+this truncated-moment setup — `f_1` stays positive across the `γ_mc` sweep. See
+[`docs/f1_trustworthiness_obstacle_vs_vicinity.md`](docs/f1_trustworthiness_obstacle_vs_vicinity.md)
+for the full audit and `CLAUDE.md` for the current state of the code. Reproduce the
+trustworthy number with:
+
+```bash
+julia --threads=2 --gcthreads=1 --heap-size-hint=6G --project=. scripts/fixed_mesh_vicinity.jl
+# GUI of the device:  julia --project=. scripts/show_gmsh_vicinity.jl
+```
+
+A trustworthy *obstacle* `f_1` would need a preconditioned fine-mesh solver or a
+structured boundary-fitted obstacle mesh — neither available in the current
+environment.
+
 ## Why this measurement
 
 For a linear Boltzmann model (which is what `IsotropicFermiHarmonics2D`
