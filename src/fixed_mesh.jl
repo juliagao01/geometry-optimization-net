@@ -44,7 +44,7 @@ export DensityField, BrinkmanSource,
        FixedEvaluator, run_f1_fixed, run_f1_fixed_steady,
        FixedOperator, assemble_fixed_operator, f1_exact, f1_adjoint_grad,
        f1_exact_perdof, fourier_perdof,
-       solve_nonlinear_steady
+       solve_nonlinear_steady, f2_perturbation
 
 # ---------------------------------------------------------------------------
 # Density field on a fixed background grid
@@ -731,6 +731,56 @@ function solve_nonlinear_steady(op::FixedOperator, ev_nl::FixedEvaluator;
         u .-= relax .* (F \ r)                      # chord step (fixed Jacobian)
     end
     return u, res, iters, converged
+end
+
+# Raw probe drop ΔV = V_A - V_B for state u (a rhs! call populates the BC caches).
+# NOT divided by I_source, so with I_source=1 this equals the functional cᵀu.
+function _probe_dV_raw(ev::FixedEvaluator, u::AbstractVector)
+    semi = ev.semi
+    scr = similar(u); Trixi.rhs!(scr, u, semi, 0.0)
+    _, equations, dg, cache = Trixi.mesh_equations_solver_cache(semi)
+    return FermiSea._current_contact_potential(ev.bc_probe_A, equations, dg, cache) -
+           FermiSea._current_contact_potential(ev.bc_probe_B, equations, dg, cache)
+end
+
+"""
+    f2_perturbation(ev_lin, ev_nl; eps=1e-6, atol=1e-11, rtol=1e-10, memory=100, itmax=30000)
+        -> (f1, f2, info)
+
+Second-order response coefficients via matrix-free perturbation theory — NO assembly,
+NO nonlinear iteration. The nonlinear source is exactly quadratic-homogeneous, so with
+`u(I) = I·u₁ + I²·u₂ + …` the steady equation `A₀u + I·b + S(u) = 0` gives
+
+    A₀ u₁ = -b        (linear solution)           f₁ = ΔV(u₁)
+    A₀ u₂ = -S(u₁)    (S = the nonlinear source)  f₂ = ΔV(u₂)
+
+Each order is ONE Tikhonov-regularized GMRES on `A₀` (matvec `rhs_lin(v)-b+εv`), which
+scales to fine meshes on the structured vicinity mesh (unlike the O(N²) probing
+assembly). `ev_lin` is a `FixedEvaluator` with NO nonlinear source (`I_source=1`);
+`ev_nl` is identical but WITH it. The nonlinear source contribution is recovered
+exactly as `S(u₁) = rhs_nl(u₁) - rhs_lin(u₁)`. `f₂` is linear in the source strength λ,
+so building `ev_nl` at `λ=1` returns `f₂/λ`. `f₂` is the EXACT leading second-order
+coefficient (no amplitude-fitting), cleanly separated from `f₁`.
+"""
+function f2_perturbation(ev_lin::FixedEvaluator, ev_nl::FixedEvaluator;
+                         eps::Real=1e-6, atol::Real=1e-11, rtol::Real=1e-10,
+                         memory::Int=100, itmax::Int=30000)
+    semi_l = ev_lin.semi; semi_n = ev_nl.semi
+    FermiSea.initialize_boundary_projectors!(semi_l)
+    FermiSea.initialize_boundary_projectors!(semi_n)
+    ode = Trixi.semidiscretize(semi_l, (0.0, 1.0)); N = length(ode.u0)
+    b = similar(ode.u0); Trixi.rhs!(b, zero(ode.u0), semi_l, 0.0)   # linear forcing (∝ I_source=1)
+    scr = similar(b)
+    A = LinearMap{Float64}((out, v) -> (Trixi.rhs!(scr, v, semi_l, 0.0); @. out = scr - b + eps * v; out),
+                           N; ismutating=true)
+    u1, st1 = Krylov.gmres(A, -b;  restart=true, memory=memory, atol=atol, rtol=rtol, itmax=itmax)
+    rn = similar(b); rl = similar(b)
+    Trixi.rhs!(rn, u1, semi_n, 0.0); Trixi.rhs!(rl, u1, semi_l, 0.0)
+    S1 = rn .- rl                                                   # = S_nl(u1), exactly
+    u2, st2 = Krylov.gmres(A, -S1; restart=true, memory=memory, atol=atol, rtol=rtol, itmax=itmax)
+    f1 = _probe_dV_raw(ev_lin, u1)
+    f2 = _probe_dV_raw(ev_lin, u2)
+    return f1, f2, (; N, it1=st1.niter, it2=st2.niter, conv1=st1.solved, conv2=st2.solved)
 end
 
 """

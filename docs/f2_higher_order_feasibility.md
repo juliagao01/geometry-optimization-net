@@ -181,9 +181,19 @@ clone `~/cu/FermiSea-nl` on branch `nonlinear-convective`; this repo on branch
   (slight droop to −0.01467 at λ=0.1 as higher-order-in-λ terms enter): f2 is linear in
   λ at leading order — the nonlinearity IS the source of f2. ✅
 - Chord solver converges in 2–11 iterations (residual ~1e-11) at every λ and I. ✅
-- **Caveat — f2 magnitude not yet mesh-converged**: at coarse h=.09/.07/.055 it reads
-  −2.05/−1.48/−2.24 ×1e-4 (~35% scatter, no sign flips). A higher-order quantity needs
-  finer meshes than f1 did; a proper finer-h convergence study is the next validation.
+- **f2 IS mesh-convergent — pinned via matrix-free perturbation theory.** Because the
+  nonlinear source is exactly quadratic-homogeneous, `u(I)=I·u1+I²·u2` gives `A0 u1=-b`
+  (→ f1=ΔV(u1)) and `A0 u2=-S(u1)` (→ f2=ΔV(u2)) — TWO reg-GMRES solves, NO assembly, NO
+  nonlinear iteration (`f2_perturbation` in `src/fixed_mesh.jl`; `scripts/fixed_mesh_f2pin.jl`).
+  This kills the O(N²) assembly bottleneck and reaches N=120k like f1. Results:
+  - **ε-insensitive**: f2/λ = −0.0228720/−0.0228703/−0.0228703 at ε=1e-4/1e-6/1e-8 (7 digits),
+    and agrees with the independent chord-solver value — two methods cross-checked.
+  - **h-convergence** (f2/λ, ε=1e-6): −0.02287/−0.02248/−0.02337/−0.02430/−0.02404/−0.02350
+    at h=.065/.052/.042/.033/.027/.022 (N up to 120k). f1 only converges (→0.0203) at
+    h≤0.033, and there f2/λ = −0.0243/−0.0240/−0.0235 — a ~2% band drifting gently to ≈−0.023.
+  - **Pinned value: f2/λ ≈ −0.023 to −0.024 (~±3%)**, ε-stable, bounded, convergent (no
+    scatter/sign-flip, unlike the hard-wall obstacle). Noisier than f1 (it squares the
+    current field near the contacts); <1% would need h<0.02 (N>150k).
 
 **Scope note.** This is the *local* inertial-stress nonlinearity — the correct `j⊗j`
 tensor structure but not the full convective operator (the gradient `∇·` part is
