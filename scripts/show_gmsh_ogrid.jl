@@ -9,7 +9,11 @@ using Gmsh: gmsh
 using Printf
 workdir = joinpath(@__DIR__, "..", "runs", "fixed_mesh"); mkpath(workdir)
 geo = joinpath(workdir, "ogrid_show.geo")
-_, m = write_blockstruct_geo(geo; h=0.05)
+# default to the OPTIMIZED winner (result_ogrid.jld2): square @ (0.612,+0.215) s=0.132,
+# with the optimization's probe span xPL=0.45,xPR=1.15. Override via XC/YC/S env vars.
+xc = parse(Float64, get(ENV,"XC","0.612")); yc = parse(Float64, get(ENV,"YC","0.215"))
+sq = parse(Float64, get(ENV,"S","0.132"))
+_, m = write_blockstruct_geo(geo; h=0.045, xc=xc, yc=yc, s=sq, xPL=0.45, xPR=1.15)
 @printf("blocks: %d cols x %d rows; obstacle block=(%d,%d); source row=%d; probe cols=%s\n",
         m.nx, m.ny, m.ci, m.cj, m.jsrc, m.cprobe)
 @printf("clearances: top=%.2f bottom=%.2f sides=%.2f source-gap=%.2f\n",
