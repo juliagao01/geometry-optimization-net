@@ -28,14 +28,25 @@ for (et,tg) in zip(etypes,etags); et==3 && (global nq+=length(tg)); et==2 && (gl
 if get(ENV,"NOGUI","")=="1"; gmsh.finalize(); println("DONE (headless)"); exit(); end
 # CLEAN view: just the structured quad grid (which conforms to the circle via the O-grid)
 # + the obstacle circle outlined. No thick colored 1D clutter from the internal spokes/arcs.
+# --- faint, muted mesh grid (thin, soft gray — no neon) ---
 gmsh.option.setNumber("Mesh.SurfaceEdges",1)     # the quad grid
 gmsh.option.setNumber("Mesh.SurfaceFaces",0)     # no fill
-gmsh.option.setNumber("Mesh.Lines",0)            # <- drop the busy colored boundary lines
+gmsh.option.setNumber("Mesh.Lines",0)            # no 1D-element clutter
 gmsh.option.setNumber("Mesh.Points",0)
-gmsh.option.setNumber("Mesh.ColorCarousel",0)    # single neutral mesh color
-gmsh.option.setNumber("Geometry.Curves",1)       # show CAD curves (thin) so the circle+contacts read
+gmsh.option.setNumber("Mesh.ColorCarousel",0)    # single color, not by-group neon
+gmsh.option.setNumber("Mesh.LineWidth",0.7)      # thin grid
+gmsh.option.setColor("Mesh.Lines",       165,170,180,255)  # soft gray-blue grid
+gmsh.option.setColor("Mesh.Quadrangles", 165,170,180,255)
+gmsh.option.setColor("Mesh.Triangles",   165,170,180,255)
+# --- bold ONLY the obstacle circle over the faint grid ---
+gmsh.option.setNumber("Geometry.Curves",1)       # CAD curves channel (independent width)
+gmsh.option.setNumber("Geometry.CurveWidth",5)   # bold
 gmsh.option.setNumber("Geometry.Points",0)
-gmsh.option.setNumber("Geometry.CurveWidth",2)
+allc = gmsh.model.getEntities(1)                  # hide every CAD curve...
+gmsh.model.setVisibility(allc, 0)
+obs = [(1,601),(1,602),(1,603),(1,604)]           # ...except the 4 circle arcs (the obstacle)
+gmsh.model.setVisibility(obs, 1)
+gmsh.model.setColor(obs, 200, 40, 40)             # bold red obstacle outline
 println("Opening Gmsh — STRUCTURED channel with a floating CIRCULAR obstacle (O-grid")
 println("rings wrap the circle). source=left, drain=right, probe_A=top, probe_B=bottom.")
 println("The smooth circle in the middle is the obstacle. Close to end."); flush(stdout)
