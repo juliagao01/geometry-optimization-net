@@ -44,7 +44,7 @@ export DensityField, BrinkmanSource,
        FixedEvaluator, run_f1_fixed, run_f1_fixed_steady,
        FixedOperator, assemble_fixed_operator, f1_exact, f1_adjoint_grad,
        f1_exact_perdof, fourier_perdof,
-       solve_nonlinear_steady, f2_perturbation
+       solve_nonlinear_steady, f2_perturbation, perturbation_coeffs
 
 # ---------------------------------------------------------------------------
 # Density field on a fixed background grid
@@ -781,6 +781,55 @@ function f2_perturbation(ev_lin::FixedEvaluator, ev_nl::FixedEvaluator;
     f1 = _probe_dV_raw(ev_lin, u1)
     f2 = _probe_dV_raw(ev_lin, u2)
     return f1, f2, (; N, it1=st1.niter, it2=st2.niter, conv1=st1.solved, conv2=st2.solved)
+end
+
+"""
+    perturbation_coeffs(semi_lin, semi_nl, dV; order=3, eps=1e-6, ...) -> (coeffs, info)
+
+Response coefficients `[f_1, …, f_order]` of `ΔV(I) = Σ f_n Iⁿ` via recursive perturbation
+of the QUADRATIC-nonlinear steady state `A0·u + I·b + B(u,u) = 0`. A quadratic nonlinearity
+generates all higher orders: with `u(I)=Σ Iⁿ uₙ`,
+
+    A0 u1 = -b ;   A0 uₙ = -Σ_{i+j=n, i,j≥1} B(u_i,u_j)   (n≥2) ;   f_n = ΔV(uₙ).
+
+Each order is ONE Tikhonov-reg GMRES solve on `A0` (matvec `rhs_lin(v)-b+εv`, matrix-free,
+scales to fine meshes). `semi_lin` has no nonlinear source; `semi_nl` is identical but WITH
+it; `dV(u)` returns the raw probe drop `V_A-V_B` for a state `u`. The symmetric bilinear
+form is recovered by polarization from the exactly-quadratic source:
+`2 B(a,b) = S(a+b) - S(a) - S(b)` with `S(w) = rhs_nl(w) - rhs_lin(w)`. `f_n ∝ λ^{n-1}` in
+the source strength λ — a built-in check. Generalizes [`f2_perturbation`](@ref); works on
+any structured mesh where reg-GMRES converges (e.g. the O-grid circle).
+"""
+function perturbation_coeffs(semi_lin, semi_nl, dV::Function; order::Int=3, eps::Real=1e-6,
+                             atol::Real=1e-11, rtol::Real=1e-10, memory::Int=100, itmax::Int=40000)
+    FermiSea.initialize_boundary_projectors!(semi_lin)
+    FermiSea.initialize_boundary_projectors!(semi_nl)
+    ode = Trixi.semidiscretize(semi_lin, (0.0, 1.0)); N = length(ode.u0)
+    b = similar(ode.u0); Trixi.rhs!(b, zero(ode.u0), semi_lin, 0.0)
+    scr = similar(b); tn = similar(b); tl = similar(b)
+    A = LinearMap{Float64}((out, v) -> (Trixi.rhs!(scr, v, semi_lin, 0.0); @. out = scr - b + eps * v; out),
+                           N; ismutating=true)
+    Snl(w) = (Trixi.rhs!(tn, w, semi_nl, 0.0); Trixi.rhs!(tl, w, semi_lin, 0.0); tn .- tl)  # = B(w,w)
+    us  = Vector{Vector{Float64}}(undef, order)
+    snl = Vector{Vector{Float64}}(undef, order)   # cache S(u_i)
+    fs  = zeros(order); its = zeros(Int, order); conv = trues(order)
+    for n in 1:order
+        rhs = if n == 1
+            -b
+        else
+            term = zeros(N)
+            for i in 1:n-1
+                sij = Snl(us[i] .+ us[n-i])                    # S(u_i+u_j)
+                @. term += 0.5 * (sij - snl[i] - snl[n-i])     # += B(u_i,u_j)
+            end
+            -term
+        end
+        u, st = Krylov.gmres(A, rhs; restart=true, memory=memory, atol=atol, rtol=rtol, itmax=itmax)
+        us[n] = u; its[n] = st.niter; conv[n] = st.solved
+        snl[n] = Snl(u)
+        fs[n] = dV(u)
+    end
+    return fs, (; N, iters=its, conv)
 end
 
 """
